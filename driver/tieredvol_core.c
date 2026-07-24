@@ -122,12 +122,22 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 
 	logical = (u64)bio->bi_iter.bi_sector << SECTOR_SHIFT;
 
-	if (ctx->adaptive_enabled)
+	switch (ctx->policy) {
+	case TV_POLICY_ADAPTIVE:
 		cur = tv_map_logical_adaptive(logical, &ctx->meta,
 					      ctx->ema_load, ctx->stale,
-					      ctx->ndisks);
-	else
+					      ctx->ndisks,
+					      ctx->total_write_bytes,
+					      ctx->wear_bias);
+		break;
+	case TV_POLICY_RANDOM:
+		cur = tv_map_logical_random(logical, &ctx->meta);
+		break;
+	case TV_POLICY_STATIC:
+	default:
 		cur = tv_map_logical(logical, &ctx->meta);
+		break;
+	}
 
 	if (cur.disk < 0 || cur.disk >= ctx->ndisks) {
 		pr_err("tieredvol: map failed for sector %llu\n",
@@ -139,6 +149,13 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 	bio_set_dev(bio, ctx->devs[cur.disk]->bdev);
 	bio->bi_iter.bi_sector = cur.offset >> SECTOR_SHIFT;
 	atomic_add(bio->bi_iter.bi_size, &ctx->in_flight_bytes[cur.disk]);
+	if (bio_data_dir(bio) == WRITE) {
+		ctx->total_write_bytes[cur.disk] += bio->bi_iter.bi_size;
+		ctx->total_write_ops[cur.disk]++;
+	} else {
+		ctx->total_read_bytes[cur.disk] += bio->bi_iter.bi_size;
+		ctx->total_read_ops[cur.disk]++;
+	}
 	this_cpu_inc(tv_map_count);
 	this_cpu_add(tv_map_sectors, bio_sectors(bio));
 	this_cpu_add(tv_map_bytes, bio->bi_iter.bi_size);
@@ -216,6 +233,8 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 	ctx->adaptive_enabled = false;
 	ctx->ema_weight_shift = 3;
 	ctx->stale_after_ns = 5000000000ULL;
+	ctx->wear_bias = 0;
+	ctx->policy = TV_POLICY_STATIC;
 
 	timer_setup(&ctx->decay_timer, tv_decay_timer_fn, 0);
 	mod_timer(&ctx->decay_timer, jiffies + TV_DECAY_INTERVAL);
@@ -375,6 +394,9 @@ static void tieredvol_status(struct dm_target *ti, status_type_t type,
 	case STATUSTYPE_INFO: {
 		int i, off = 0;
 
+		off += snprintf(result + off, maxlen - off,
+				"policy=%d", ctx->policy);
+
 		for (i = 0; i < ctx->ndisks && off < (int)maxlen - 2; i++) {
 			char status = 'A';
 
@@ -383,7 +405,13 @@ static void tieredvol_status(struct dm_target *ti, status_type_t type,
 				status = 'D';
 
 			off += snprintf(result + off, maxlen - off,
-					"%s%c", i > 0 ? " " : "", status);
+					" %c%s:rd=%llu/%llu wr=%llu/%llu",
+					status,
+					ctx->meta.disk_names[i],
+					ctx->total_read_ops[i],
+					ctx->total_read_bytes[i],
+					ctx->total_write_ops[i],
+					ctx->total_write_bytes[i]);
 		}
 		break;
 	}
@@ -472,18 +500,32 @@ found:
 	if (argc == 1 && strcmp(argv[0], "adaptive_on") == 0) {
 		struct tieredvol_ctx *ctx = ti->private;
 
-		ctx->adaptive_enabled = true;
-		pr_info("tieredvol: adaptive weights ENABLED\n");
+		ctx->policy = TV_POLICY_ADAPTIVE;
+		pr_info("tieredvol: policy = adaptive\n");
 		return 0;
 	}
 	if (argc == 1 && strcmp(argv[0], "adaptive_off") == 0) {
 		struct tieredvol_ctx *ctx = ti->private;
 
-		ctx->adaptive_enabled = false;
-		pr_info("tieredvol: adaptive weights DISABLED\n");
+		ctx->policy = TV_POLICY_STATIC;
+		pr_info("tieredvol: policy = static\n");
 		return 0;
 	}
-	if (argc == 2 && strcmp(argv[0], "set_ema_shift") == 0) {
+	if (argc == 2 && strcmp(argv[0], "set_policy") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+
+		if (strcmp(argv[1], "static") == 0)
+			ctx->policy = TV_POLICY_STATIC;
+		else if (strcmp(argv[1], "adaptive") == 0)
+			ctx->policy = TV_POLICY_ADAPTIVE;
+		else if (strcmp(argv[1], "random") == 0)
+			ctx->policy = TV_POLICY_RANDOM;
+		else
+			return -EINVAL;
+		pr_info("tieredvol: policy = %s\n", argv[1]);
+		return 0;
+	}
+	if (argc == 1 && strcmp(argv[0], "set_ema_shift") == 0) {
 		struct tieredvol_ctx *ctx = ti->private;
 		u32 shift;
 
@@ -509,19 +551,84 @@ found:
 		int i, off = 0;
 
 		off += snprintf(result + off, maxlen - off,
-				"enabled=%d ema_shift=%u stale_ms=%llu",
-				ctx->adaptive_enabled,
+				"policy=%d ema_shift=%u stale_ms=%llu wear_bias=%u",
+				ctx->policy,
 				ctx->ema_weight_shift,
-				ctx->stale_after_ns / 1000000ULL);
+				ctx->stale_after_ns / 1000000ULL,
+				ctx->wear_bias);
 		for (i = 0; i < ctx->ndisks && off < (int)maxlen - 1; i++) {
 			off += snprintf(result + off, maxlen - off,
-					" %s:load=%llu inflight=%u stale=%d",
+					" %s:load=%llu writes=%llu stale=%d",
 					ctx->meta.disk_names[i],
 					ctx->ema_load[i],
-					atomic_read(&ctx->in_flight_bytes[i]),
+					ctx->total_write_bytes[i],
 					ctx->stale[i]);
 		}
 		pr_info("tieredvol: %s\n", result);
+		return 0;
+	}
+	if (argc == 1 && strcmp(argv[0], "show_wear") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+		int i, off = 0;
+
+		off += snprintf(result + off, maxlen - off,
+				"wear_bias=%u", ctx->wear_bias);
+		for (i = 0; i < ctx->ndisks && off < (int)maxlen - 2; i++) {
+			off += snprintf(result + off, maxlen - off,
+					" %s=%llu",
+					ctx->meta.disk_names[i],
+					ctx->total_write_bytes[i]);
+		}
+		pr_info("tieredvol: %s\n", result);
+		return 0;
+	}
+	if (argc == 1 && strcmp(argv[0], "show_io_stats") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+		int i, off = 0;
+
+		for (i = 0; i < ctx->ndisks && off < (int)maxlen - 2; i++) {
+			off += snprintf(result + off, maxlen - off,
+					"%s%s:rd=%llu/%llu wr=%llu/%llu",
+					i > 0 ? " " : "",
+					ctx->meta.disk_names[i],
+					ctx->total_read_ops[i],
+					ctx->total_read_bytes[i],
+					ctx->total_write_ops[i],
+					ctx->total_write_bytes[i]);
+		}
+		pr_info("tieredvol: %s\n", result);
+		return 0;
+	}
+	if (argc == 1 && strcmp(argv[0], "reset_io_stats") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+		int i;
+
+		for (i = 0; i < ctx->ndisks; i++) {
+			ctx->total_read_bytes[i] = 0;
+			ctx->total_write_bytes[i] = 0;
+			ctx->total_read_ops[i] = 0;
+			ctx->total_write_ops[i] = 0;
+		}
+		pr_info("tieredvol: IO stats reset\n");
+		return 0;
+	}
+	if (argc == 2 && strcmp(argv[0], "set_wear_bias") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+		u32 bias;
+
+		if (kstrtou32(argv[1], 10, &bias) || bias > 1024)
+			return -EINVAL;
+		ctx->wear_bias = bias;
+		pr_info("tieredvol: wear_bias=%u\n", bias);
+		return 0;
+	}
+	if (argc == 1 && strcmp(argv[0], "reset_wear") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+		int i;
+
+		for (i = 0; i < ctx->ndisks; i++)
+			ctx->total_write_bytes[i] = 0;
+		pr_info("tieredvol: wear counters reset\n");
 		return 0;
 	}
 
@@ -579,4 +686,4 @@ module_exit(tieredvol_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("TieredVol");
 MODULE_DESCRIPTION("Weighted striped dm target for tiered storage");
-MODULE_VERSION("4.2.0");
+MODULE_VERSION("4.5.0");

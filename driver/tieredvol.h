@@ -38,6 +38,12 @@ struct tieredvol_map {
 	u64 length;
 };
 
+enum tv_policy {
+	TV_POLICY_STATIC = 0,
+	TV_POLICY_ADAPTIVE = 1,
+	TV_POLICY_RANDOM = 2,
+};
+
 struct tieredvol_ctx {
 	struct dm_target *ti;
 	struct tieredvol_metadata meta;
@@ -58,6 +64,12 @@ struct tieredvol_ctx {
 	u64 grace_until_ns[TV_MAX_DISKS];
 	struct timer_list decay_timer;
 	u64 last_interval_bytes[TV_MAX_DISKS];
+	u64 total_write_bytes[TV_MAX_DISKS];
+	u64 total_read_bytes[TV_MAX_DISKS];
+	u64 total_write_ops[TV_MAX_DISKS];
+	u64 total_read_ops[TV_MAX_DISKS];
+	u32 wear_bias;
+	enum tv_policy policy;
 	struct work_struct trigger_event;
 };
 
@@ -66,7 +78,11 @@ struct tieredvol_map tv_map_logical(u64 logical,
 struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 					    struct tieredvol_metadata *meta,
 					    u64 *ema_load, bool *stale,
-					    int ndisks);
+					    int ndisks,
+					    u64 *total_write_bytes,
+					    u32 wear_bias);
+struct tieredvol_map tv_map_logical_random(u64 logical,
+					  struct tieredvol_metadata *meta);
 int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
 			    const char *path);
 

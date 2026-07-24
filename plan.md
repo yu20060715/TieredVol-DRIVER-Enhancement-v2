@@ -100,30 +100,44 @@
 
 ## 三、第三層：野心大的（需要寫新 code，1-2週）
 
-### 3.1 Mirror/RAID1 模式
+### 3.1 SSD 磨損均衡 ✅ DONE
+- **來源**：bcache wear leveling pattern
+- **做法**：追蹤每顆碟的總寫入量，adaptive 時加入 wear penalty
+- **實際做法**：`total_write_bytes[]` per disk, `wear_bias` tunable, adaptive load += wear_bias * disk_writes / total_writes
+- **效果**：延長 SSD 壽命，較少寫入的碟會被優先選擇
+- **難度**：高
+
+### 3.2 寫入分佈策略 ✅ DONE
+- **來源**：dm-switch.c / dm-default-key.c policy pattern
+- **做法**：三種策略 — static (weighted stripe), adaptive (lowest EMA+wear), random
+- **實際做法**：`enum tv_policy`, `set_policy static|adaptive|random`
+- **效果**：可依需求切換分佈策略
+- **難度**：中
+
+### 3.3 Per-disk IO Stats ✅ DONE
+- **來源**：dm-stats.c pattern
+- **做法**：追蹤每顆碟的 read/write bytes + ops，`show_io_stats` 和 `reset_io_stats` message
+- **效果**：詳細的 I/O 統計，可用於效能分析
+- **難度**：低
+
+### 3.4 Mirror/RAID1 模式
 - **來源**：`dm-stripe.c` 錯誤處理 pattern + dm-crypt workqueue pattern
 - **做法**：寫入時同時寫兩顆碟，讀時選快的那顆
 - **效果**：資料冗餘，一顆碟壞了不丟資料
-- **難度**：高
+- **難度**：高（未實作）
 
-### 3.2 線上重新平衡
+### 3.5 線上重新平衡
 - **來源**：dm-linear resize pattern
 - **做法**：改權重時自動搬資料到新配置
 - **需求**：metadata 支援搬運追蹤
 - **效果**：不停機調整資料分佈
-- **難度**：高
+- **難度**：高（未實作）
 
-### 3.3 寫入快取
+### 3.6 寫入快取
 - **來源**：dm-writecache.c pattern
 - **做法**：RAM buffer 緩衝寫入，定期 flush 到碟
 - **效果**：突發寫入效能大幅提升
-- **難度**：高
-
-### 3.4 SSD 磨損均衡
-- **來源**：bcache wear leveling pattern
-- **做法**：追蹤每顆碟的總寫入量，均勻分配寫入
-- **效果**：延長 SSD 壽命
-- **難度**：高
+- **難度**：高（未實作）
 
 ---
 
@@ -138,6 +152,9 @@
 | Service time formula | dm-ps-service-time.c | 136-211 | `st_compare_load()` — 交叉相乘避免除法 |
 | EMA | dm-ps-historical-service-time.c | 105-118 | `fixed_ema()` |
 | Staleness | dm-ps-historical-service-time.c | 310-323 | `stale_after` + `last_finish` |
+| Wear leveling | bcache wear leveling | — | `total_write_bytes` + bias in adaptive load |
+| Policy switch | dm-switch.c / dm-default-key.c | — | `enum tv_policy` + `set_policy` message |
+| IO stats | dm-stats.c | — | per-disk read/write ops + bytes |
 
 ---
 
@@ -145,7 +162,8 @@
 
 1. ~~**第一層**：先做 1.1-1.7~~ ✅ DONE (v4.3.0)
 2. ~~**第二層**：再做 2.1-2.6~~ ✅ DONE (v4.4.0)
-3. **第三層**：看需求決定要不要做 3.1-3.4（野心大的，1-2月）
+3. ~~**第三層**：3.1-3.3 實用功能~~ ✅ DONE (v4.5.0)
+4. 3.4-3.6 高難度功能（Mirror、Rebalance、Write Cache）— 需要 sub-bios/workqueue 架構
 
 ---
 
@@ -175,3 +193,10 @@
 ### v4.3.0 freeze bisect 結論
 - 5 個 feature group 全部獨立測試通過
 - freeze 原因：尚未確認，但 v4.3.0 穩定運行
+
+### v4.5.0 throughput by policy
+- **static**: 2449 MiB/s (baseline, weighted stripe)
+- **random**: 1417 MiB/s (42% of static, uneven disk distribution)
+- **adaptive**: 1037 MiB/s (42% of static, per-bio EMA/wear lookup overhead)
+- Adaptive overhead 來源：非本地記憶體存取 (`ctx->ema_load[]`, `ctx->total_write_bytes[]`) + branch prediction miss
+- 結論：動態策略犧牲 throughput 換取 load distribution 和 wear leveling
