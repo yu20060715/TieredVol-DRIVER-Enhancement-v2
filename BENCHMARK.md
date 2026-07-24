@@ -18,7 +18,7 @@ SATA: Both on Intel 8 Series/C220 SATA III controller (shared bus ~957 MB/s comb
 - Segment 0: [0, 231 GB) → 3 disks, weights [1,1,6] (NVMe gets 75%)
 - Segment 1: [231 GB, 464 GB) → 2 disks, weights [1,3] (NVMe gets 75%)
 - Segment 2: [464 GB, 930 GB) → 1 disk (NVMe only)
-- Driver: v4.2.0 (DM_TARGET_NOWAIT, per-CPU stats, 0.25µs/map call)
+- Driver: v4.6.0 (DM_TARGET_NOWAIT, per-CPU stats, mirror/RAID1, adaptive striping, 0.25µs/map call)
 - Kernel: 6.14.0-27-generic, module built out-of-tree
 
 ## fio Benchmark Results

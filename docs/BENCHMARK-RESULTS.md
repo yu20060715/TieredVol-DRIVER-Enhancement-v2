@@ -7,7 +7,10 @@
 - SATA: WD Blue NAND 250G + MX500 500G
 - OS: Lubuntu, Linux 6.x
 
-## Integration Test
+## Integration Test (pre-migration, userspace scheduler)
+
+> Historical results from the TieredVol userspace prototype (pre-kernel migration).
+
 | Test Suite | Result |
 |------------|--------|
 | test_common | 34/34 PASS |
@@ -70,7 +73,7 @@ Note: TieredVol includes NVMe with PCIe 2.0x4 (~1000 MB/s) while LVM only uses t
 
 **Date:** 2026-07-23  
 **Kernel:** 6.14.0-27-generic  
-**Module:** tieredvol v2.0.0 (kernel dm target)
+**Module:** tieredvol v4.6.0 (kernel dm target)
 
 ### Hardware
 

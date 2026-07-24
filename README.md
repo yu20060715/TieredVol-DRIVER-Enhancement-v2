@@ -1,4 +1,6 @@
-# TieredVol-DRIVER
+# TieredVol-DRIVER-Enhancement
+
+> **Research version.** All features developed here have been merged back to [TieredVol-DRIVER](https://github.com/yu20060715/TieredVol-DRIVER). This repo preserves the development history and roadmap.
 
 A kernel-level Device Mapper target for weighted striping across heterogeneous storage devices.
 
@@ -27,8 +29,15 @@ Application
 - Segment-based mapping for unequal disk capacities
 - Logical ↔ Physical offset mapping (zero-copy)
 - Zero overhead from syscall/copy/CQE
+- Mirror/RAID1 redundancy (bio_alloc_clone + fire-and-forget)
+- Adaptive striping with EMA-based load balancing
+- Staleness detection with grace period (timer-based monitoring)
+- Wear leveling (write-count-aware weight adjustment)
+- Per-disk I/O statistics (in-flight tracking, completion counters)
+- Integrity (CRC32C), atomic (O_DIRECT), crypto (AES-256-XTS) passthrough
+- Error detection with per-disk error_count and workqueue event notification
 
-### Key Results (kernel dm-target v4.2.0, fio + io_uring + QD=256)
+### Key Results (kernel dm-target v4.6.0, fio + io_uring + QD=256)
 
 | Config | Write | Efficiency | vs Theory |
 |--------|-------|------------|-----------|
@@ -43,10 +52,11 @@ DM overhead: **<1%** (raw NVMe 1475 MB/s vs DM 1499 MB/s). The 25% gap from theo
 ### What Is Intentionally Excluded
 
 - Filesystem implementation
-- Data redundancy (no mirror, no parity)
+- Data redundancy via parity (RAID5/6)
 - Crash consistency / journaling
 - Metadata recovery
 - Dynamic online rebalancing
+- Write cache (attempted and removed — bio_chain + flush_bypasses_map caused D-state hangs)
 
 ---
 
@@ -170,8 +180,9 @@ sudo make install       # Install to /usr/local/bin/
 ## Project Structure
 
 ```
-TieredVol-DRIVER/
+TieredVol-DRIVER-Enhancement/
 ├── README.md
+├── plan.md                       # Development roadmap (historical)
 ├── MIGRATION.md                  # Migration plan from userspace to kernel
 ├── Makefile
 ├── driver/                       # Kernel dm-target module
@@ -238,13 +249,15 @@ TieredVol-DRIVER/
 
 ---
 
-## Kernel Module (v4.2.0)
+## Kernel Module (v4.6.0)
 
 The `tieredvol` dm target processes bios in-kernel:
 
 1. **bio arrives** at the dm target (from VFS `write()`/`read()`)
 2. **Map**: `tv_map_logical()` translates logical byte offset → (disk, physical_offset, remaining)
-3. **Redirect**: `bio_set_dev()` + sector update → DM core submits to underlying device
+3. **Policy**: static weights, adaptive (EMA load + wear bias), or random per-segment
+4. **Mirror**: if enabled, `bio_alloc_clone()` + fire-and-forget to redundant disk
+5. **Redirect**: `bio_set_dev()` + sector update → DM core submits to underlying device
 
 Key features:
 - `DM_TARGET_NOWAIT`: Non-blocking bio dispatch (optimized for io_uring)
@@ -252,6 +265,11 @@ Key features:
 - `dm_set_target_max_io_len()`: Bio splitting at chunk boundaries
 - Per-CPU statistics counters (zero contention)
 - **Map overhead: 0.25 µs/bio** (ftrace profiled)
+- Mirror/RAID1: per-segment `mirror_enabled` + `mirror_disk` config
+- Adaptive striping: EMA-based load balancing with `ema_weight_shift` (default α=0.8%)
+- Staleness detection: 1s timer, grace period fallback to static weights
+- Wear leveling: per-disk `total_write_bytes[]` with `wear_bias` parameter
+- Integrity (CRC32C), atomic (O_DIRECT), crypto (AES-256-XTS) DM target passthrough
 
 Key constants:
 - `TV_CHUNK_SIZE` = 1 MB (weight unit)
@@ -276,14 +294,16 @@ seg0_count=2
 seg0_disks=0,1
 seg0_weight=2,1
 seg0_stripe=3145728
+seg0_mirror=1          # optional: mirror to disk index 1
+seg0_policy=adaptive   # optional: static (default), adaptive, random
 ```
 
 ---
 
 ## Limitations
 
-- **Static weights only** — Weights are computed at initialization and fixed.
-- **No fault tolerance** — If any disk fails, the entire stripe set is lost.
+- **Static weights only by default** — Adaptive striping available via `set_policy` message, but requires timer support.
+- **No parity-based redundancy** — Mirror/RAID1 supported, but no RAID5/6.
 - **No POSIX write() interception** — Applications use standard `write()`/`read()` on the dm target device.
 - **No crash consistency** — No journaling or metadata recovery.
 - **System disk cannot be used** — dm returns EBUSY on mounted root partition.
