@@ -54,6 +54,7 @@ struct tieredvol_map tv_map_logical(u64 logical,
 		struct tieredvol_map map;
 
 		map.disk = (int)seg->disk_index[disk_idx];
+		map.seg_idx = seg_idx;
 		map.offset = stripe_no * (u64)seg->weight[disk_idx] *
 			     TV_CHUNK_SIZE +
 			     (offset_in - boundary[disk_idx]);
@@ -145,6 +146,7 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 		u64 disk_chunk = (u64)seg->weight[best_disk] * TV_CHUNK_SIZE;
 
 		map.disk = (int)seg->disk_index[best_disk];
+		map.seg_idx = seg_idx;
 		map.offset = stripe_no * disk_chunk +
 			     (offset_in % disk_chunk);
 		map.length = disk_chunk;
@@ -189,6 +191,7 @@ struct tieredvol_map tv_map_logical_random(u64 logical,
 		u64 disk_chunk = (u64)seg->weight[disk_idx] * TV_CHUNK_SIZE;
 
 		map.disk = (int)seg->disk_index[disk_idx];
+		map.seg_idx = seg_idx;
 		map.offset = stripe_no * disk_chunk +
 			     (offset_in % disk_chunk);
 		map.length = disk_chunk;

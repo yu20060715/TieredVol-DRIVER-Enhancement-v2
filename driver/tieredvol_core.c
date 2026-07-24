@@ -109,11 +109,24 @@ static void tv_decay_timer_fn(struct timer_list *timer)
 	mod_timer(&ctx->decay_timer, jiffies + TV_DECAY_INTERVAL);
 }
 
+static void tv_mirror_end_io(struct bio *bio)
+{
+	struct tieredvol_ctx *bio_ctx = bio->bi_private;
+
+	if (bio->bi_status != BLK_STS_OK)
+		bio_ctx->mirror_errors++;
+	else
+		bio_ctx->mirror_write_ops++;
+
+	bio_put(bio);
+}
+
 static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 {
 	struct tieredvol_ctx *ctx = ti->private;
 	u64 logical;
 	struct tieredvol_map cur;
+	int ret;
 
 	logical = (u64)bio->bi_iter.bi_sector << SECTOR_SHIFT;
 
@@ -154,6 +167,33 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 	this_cpu_inc(tv_map_count);
 	this_cpu_add(tv_map_sectors, bio_sectors(bio));
 	this_cpu_add(tv_map_bytes, bio->bi_iter.bi_size);
+
+	/* Mirror write: clone bio and submit to mirror disk */
+	if (bio_data_dir(bio) == WRITE &&
+	    cur.seg_idx >= 0 &&
+	    cur.seg_idx < (int)ctx->meta.segment_count) {
+		struct tieredvol_segment *seg =
+			&ctx->meta.segments[cur.seg_idx];
+
+		if (seg->mirror_enabled &&
+		    seg->mirror_disk < (u32)ctx->ndisks &&
+		    seg->mirror_disk != (u32)cur.disk) {
+			struct bio *clone;
+
+			clone = bio_alloc_clone(ctx->devs[seg->mirror_disk]->bdev,
+						bio, GFP_NOIO, NULL);
+			if (clone) {
+				clone->bi_iter.bi_sector = cur.offset >> SECTOR_SHIFT;
+				clone->bi_private = ctx;
+				clone->bi_end_io = tv_mirror_end_io;
+				ctx->mirror_write_bytes += bio->bi_iter.bi_size;
+				submit_bio(clone);
+			} else {
+				ctx->mirror_errors++;
+			}
+		}
+	}
+
 	return DM_MAPIO_REMAPPED;
 }
 
@@ -230,6 +270,9 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 	ctx->stale_after_ns = 5000000000ULL;
 	ctx->wear_bias = 0;
 	ctx->policy = TV_POLICY_STATIC;
+	ctx->mirror_write_bytes = 0;
+	ctx->mirror_write_ops = 0;
+	ctx->mirror_errors = 0;
 
 	timer_setup(&ctx->decay_timer, tv_decay_timer_fn, 0);
 	mod_timer(&ctx->decay_timer, jiffies + TV_DECAY_INTERVAL);
@@ -390,7 +433,11 @@ static void tieredvol_status(struct dm_target *ti, status_type_t type,
 		int i, off = 0;
 
 		off += snprintf(result + off, maxlen - off,
-				"policy=%d", ctx->policy);
+				"policy=%d mirror=%llu/%llu err=%llu",
+				ctx->policy,
+				ctx->mirror_write_ops,
+				ctx->mirror_write_bytes,
+				ctx->mirror_errors);
 
 		for (i = 0; i < ctx->ndisks && off < (int)maxlen - 2; i++) {
 			char status = 'A';
@@ -624,6 +671,45 @@ found:
 		for (i = 0; i < ctx->ndisks; i++)
 			ctx->total_write_bytes[i] = 0;
 		pr_info("tieredvol: wear counters reset\n");
+		return 0;
+	}
+	if (argc == 1 && strcmp(argv[0], "show_mirror") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+		int i, off = 0;
+
+		off += snprintf(result + off, maxlen - off,
+				"mirror_wr=%llu/%llu mirror_err=%llu",
+				ctx->mirror_write_ops,
+				ctx->mirror_write_bytes,
+				ctx->mirror_errors);
+		for (i = 0; i < (int)ctx->meta.segment_count &&
+		     off < (int)maxlen - 2; i++) {
+			struct tieredvol_segment *seg =
+				&ctx->meta.segments[i];
+
+			off += snprintf(result + off, maxlen - off,
+					" seg%d:mirror=%s%d",
+					i,
+					seg->mirror_enabled ? "" : "off",
+					seg->mirror_enabled ?
+					(int)seg->mirror_disk : 0);
+		}
+		pr_info("tieredvol: %s\n", result);
+		return 0;
+	}
+	if (argc == 3 && strcmp(argv[0], "set_mirror") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+		u32 seg_idx, disk_idx;
+
+		if (kstrtou32(argv[1], 10, &seg_idx) ||
+		    kstrtou32(argv[2], 10, &disk_idx) ||
+		    seg_idx >= ctx->meta.segment_count ||
+		    disk_idx >= (u32)ctx->ndisks)
+			return -EINVAL;
+		ctx->meta.segments[seg_idx].mirror_enabled = true;
+		ctx->meta.segments[seg_idx].mirror_disk = disk_idx;
+		pr_info("tieredvol: seg%u mirror -> disk%u (%s)\n",
+			seg_idx, disk_idx, ctx->meta.disk_names[disk_idx]);
 		return 0;
 	}
 	return -EINVAL;

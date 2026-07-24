@@ -22,6 +22,8 @@ struct tieredvol_segment {
 	u32 disk_index[TV_MAX_DISKS];
 	u32 weight[TV_MAX_DISKS];
 	u64 stripe_size;
+	bool mirror_enabled;
+	u32 mirror_disk;
 };
 
 struct tieredvol_metadata {
@@ -35,6 +37,7 @@ struct tieredvol_metadata {
 
 struct tieredvol_map {
 	int disk;
+	int seg_idx;
 	u64 offset;
 	u64 length;
 };
@@ -71,6 +74,9 @@ struct tieredvol_ctx {
 	u64 total_read_ops[TV_MAX_DISKS];
 	u32 wear_bias;
 	enum tv_policy policy;
+	u64 mirror_write_bytes;
+	u64 mirror_write_ops;
+	u64 mirror_errors;
 	struct work_struct trigger_event;
 };
 

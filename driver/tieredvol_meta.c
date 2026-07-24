@@ -231,6 +231,15 @@ int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
 				ret = -EINVAL;
 				goto out;
 			}
+		} else if (strcmp(suf, "_mirror") == 0) {
+			u32 mirror_idx;
+
+			if (parse_u32(v, &mirror_idx) < 0) {
+				ret = -EINVAL;
+				goto out;
+			}
+			seg->mirror_enabled = true;
+			seg->mirror_disk = mirror_idx;
 		}
 		}
 	}
