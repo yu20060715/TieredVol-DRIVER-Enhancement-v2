@@ -3,6 +3,7 @@
 
 #include <linux/types.h>
 #include <linux/device-mapper.h>
+#include <linux/atomic.h>
 
 #define TV_MAX_DISKS    16
 #define TV_MAX_SEGS     16
@@ -10,6 +11,7 @@
 #define TV_CHUNK_SIZE   (1UL << 20)
 #define TV_SECTOR_SHIFT 9
 #define TV_SECTOR_SIZE  (1 << TV_SECTOR_SHIFT)
+#define TV_IO_ERROR_THRESHOLD 15
 
 struct tieredvol_segment {
 	u64 logical_begin;
@@ -43,6 +45,8 @@ struct tieredvol_ctx {
 	int ndisks;
 	sector_t min_chunk_sectors;
 	sector_t stripe_sectors;
+	atomic_t *error_count;
+	struct work_struct trigger_event;
 };
 
 struct tieredvol_map tv_map_logical(u64 logical,
