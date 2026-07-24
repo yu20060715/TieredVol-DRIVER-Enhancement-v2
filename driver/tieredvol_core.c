@@ -5,7 +5,6 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/percpu.h>
-#include <linux/blkdev.h>
 #include "tieredvol.h"
 
 #define DM_MSG_PREFIX "tieredvol"
@@ -65,20 +64,6 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 		return DM_MAPIO_SUBMITTED;
 	}
 
-	/* Handle discard, secure erase, and write zeroes */
-	if (unlikely(bio_op(bio) == REQ_OP_DISCARD) ||
-	    unlikely(bio_op(bio) == REQ_OP_SECURE_ERASE) ||
-	    unlikely(bio_op(bio) == REQ_OP_WRITE_ZEROES)) {
-		unsigned int target_bio_nr = dm_bio_get_target_bio_nr(bio);
-
-		if (target_bio_nr >= ctx->ndisks) {
-			bio_io_error(bio);
-			return DM_MAPIO_SUBMITTED;
-		}
-		bio_set_dev(bio, ctx->devs[target_bio_nr]->bdev);
-		return DM_MAPIO_REMAPPED;
-	}
-
 	logical = (u64)bio->bi_iter.bi_sector << SECTOR_SHIFT;
 	cur = tv_map_logical(logical, &ctx->meta);
 
@@ -97,32 +82,10 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 static int tieredvol_end_io(struct dm_target *ti, struct bio *bio,
 			    blk_status_t *error)
 {
-	struct tieredvol_ctx *ctx = ti->private;
-	unsigned int i;
-	char major_minor[16];
-
-	if (!*error)
-		return DM_ENDIO_DONE;
-
-	if (bio->bi_opf & REQ_RAHEAD)
-		return DM_ENDIO_DONE;
-
-	if (*error == BLK_STS_NOTSUPP)
-		return DM_ENDIO_DONE;
-
-	memset(major_minor, 0, sizeof(major_minor));
-	sprintf(major_minor, "%d:%d", MAJOR(bio_dev(bio)), MINOR(bio_dev(bio)));
-
-	for (i = 0; i < ctx->ndisks; i++) {
-		if (!strcmp(ctx->meta.disk_names[i], major_minor)) {
-			atomic_inc(&ctx->error_count[i]);
-			if (atomic_read(&ctx->error_count[i]) <
-			    TV_IO_ERROR_THRESHOLD)
-				queue_work(tv_wq, &ctx->trigger_event);
-		}
-	}
-
-	return DM_ENDIO_DONE;
+	/*
+	 * TODO: Implement error tracking using sub-bios if needed.
+	 */
+	return 0;
 }
 
 static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
@@ -161,18 +124,11 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 	ctx->devs = kcalloc(ctx->ndisks, sizeof(*ctx->devs), GFP_KERNEL);
 	ctx->disk_sectors = kcalloc(ctx->ndisks, sizeof(*ctx->disk_sectors),
 				    GFP_KERNEL);
-	ctx->error_count = kcalloc(ctx->ndisks, sizeof(*ctx->error_count),
-				   GFP_KERNEL);
-	if (!ctx->devs || !ctx->disk_sectors || !ctx->error_count) {
+	if (!ctx->devs || !ctx->disk_sectors) {
 		ti->error = "tieredvol: out of memory for devs";
 		ret = -ENOMEM;
 		goto free_devs;
 	}
-
-	for (i = 0; i < ctx->ndisks; i++)
-		atomic_set(&ctx->error_count[i], 0);
-
-	INIT_WORK(&ctx->trigger_event, trigger_event);
 
 	for (i = 0; i < ctx->ndisks; i++) {
 		ret = dm_get_device(ti, ctx->meta.disk_names[i],
@@ -185,6 +141,15 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 		ctx->disk_sectors[i] = bdev_nr_sectors(ctx->devs[i]->bdev);
 	}
 
+	ctx->error_count = kcalloc(ctx->ndisks, sizeof(atomic_t), GFP_KERNEL);
+	if (!ctx->error_count) {
+		ti->error = "tieredvol: out of memory for error_count";
+		ret = -ENOMEM;
+		goto put_devices;
+	}
+
+	INIT_WORK(&ctx->trigger_event, trigger_event);
+
 	for (i = 0; i < ctx->ndisks; i++)
 		pr_info("tieredvol: disk[%d] %s -> %pg (%llu sectors)\n",
 			i, ctx->meta.disk_names[i], ctx->devs[i]->bdev,
@@ -193,7 +158,7 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 	if (ctx->meta.segment_count == 0) {
 		ti->error = "tieredvol: no segments";
 		ret = -EINVAL;
-		goto put_devices;
+		goto free_error_count;
 	}
 
 	/* Compute min_chunk_sectors and stripe_sectors across all segments.
@@ -252,25 +217,24 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 	ret = dm_set_target_max_io_len(ti, ctx->min_chunk_sectors);
 	if (ret) {
 		ti->error = "tieredvol: dm_set_target_max_io_len failed";
-		goto put_devices;
+		goto free_error_count;
 	}
 
 	ti->num_flush_bios = ctx->ndisks;
 	ti->num_discard_bios = ctx->ndisks;
-	ti->num_secure_erase_bios = ctx->ndisks;
-	ti->num_write_zeroes_bios = ctx->ndisks;
 	ti->flush_bypasses_map = true;
 
 	ti->private = ctx;
 	return 0;
 
+free_error_count:
+	kfree(ctx->error_count);
 put_devices:
 	for (i = i - 1; i >= 0; i--)
 		dm_put_device(ti, ctx->devs[i]);
 free_devs:
 	kfree(ctx->devs);
 	kfree(ctx->disk_sectors);
-	kfree(ctx->error_count);
 free_ctx:
 	kfree(ctx);
 	return ret;
@@ -282,14 +246,25 @@ static void tieredvol_dtr(struct dm_target *ti)
 	int i;
 
 	flush_work(&ctx->trigger_event);
+	kfree(ctx->error_count);
 
 	for (i = 0; i < ctx->ndisks; i++)
 		dm_put_device(ti, ctx->devs[i]);
 
 	kfree(ctx->devs);
 	kfree(ctx->disk_sectors);
-	kfree(ctx->error_count);
 	kfree(ctx);
+}
+
+static int tieredvol_prepare_ioctl(struct dm_target *ti,
+				   struct block_device **bdev)
+{
+	struct tieredvol_ctx *ctx = ti->private;
+
+	if (ctx->ndisks > 0)
+		*bdev = ctx->devs[0]->bdev;
+
+	return 0;
 }
 
 static void tieredvol_io_hints(struct dm_target *ti,
@@ -302,18 +277,6 @@ static void tieredvol_io_hints(struct dm_target *ti,
 	limits->chunk_sectors = ctx->min_chunk_sectors;
 	limits->io_min = ctx->min_chunk_sectors;
 	limits->io_opt = ctx->stripe_sectors;
-}
-
-static int tieredvol_prepare_ioctl(struct dm_target *ti,
-				   struct block_device **bdev)
-{
-	struct tieredvol_ctx *ctx = ti->private;
-
-	if (ctx->ndisks == 1) {
-		*bdev = ctx->devs[0]->bdev;
-		return 0;
-	}
-	return 1;
 }
 
 static int tieredvol_iterate_devices(struct dm_target *ti,
@@ -339,18 +302,17 @@ static void tieredvol_status(struct dm_target *ti, status_type_t type,
 
 	switch (type) {
 	case STATUSTYPE_INFO: {
-		int off = 0;
-		int i;
+		int i, off = 0;
 
-		for (i = 0; i < ctx->ndisks && off < maxlen; i++) {
-			int n = snprintf(result + off, maxlen - off,
-					 "%s%s",
-					 i > 0 ? " " : "",
-					 atomic_read(&ctx->error_count[i]) <
-					 TV_IO_ERROR_THRESHOLD ? "A" : "D");
-			if (n < 0)
-				break;
-			off += n;
+		for (i = 0; i < ctx->ndisks && off < (int)maxlen - 2; i++) {
+			char status = 'A';
+
+			if (ctx->error_count &&
+			    atomic_read(&ctx->error_count[i]))
+				status = 'D';
+
+			off += snprintf(result + off, maxlen - off,
+					"%s%c", i > 0 ? " " : "", status);
 		}
 		break;
 	}
@@ -429,12 +391,10 @@ found:
 
 static struct target_type tieredvol_target = {
 	.name   = "tieredvol",
-	.version = {3, 0, 0},
+	.version = {2, 0, 0},
 	.module = THIS_MODULE,
-	.features = DM_TARGET_NOWAIT |
-		    DM_TARGET_PASSES_INTEGRITY |
-		    DM_TARGET_ATOMIC_WRITES |
-		    DM_TARGET_PASSES_CRYPTO,
+	.features = DM_TARGET_NOWAIT | DM_TARGET_PASSES_INTEGRITY |
+		    DM_TARGET_ATOMIC_WRITES | DM_TARGET_PASSES_CRYPTO,
 	.ctr    = tieredvol_ctr,
 	.dtr    = tieredvol_dtr,
 	.map    = tieredvol_map,
@@ -450,20 +410,20 @@ static int __init tieredvol_init(void)
 {
 	int ret;
 
-	tv_wq = alloc_workqueue("tv_wq", WQ_MEM_RECLAIM, 0);
-	if (!tv_wq) {
-		pr_err("tieredvol: failed to create workqueue\n");
-		return -ENOMEM;
-	}
-
 	ret = dm_register_target(&tieredvol_target);
 	if (ret < 0) {
 		pr_err("tieredvol: registration failed: %d\n", ret);
-		destroy_workqueue(tv_wq);
 		return ret;
 	}
 
-	pr_info("tieredvol: module loaded (v3.0.0)\n");
+	tv_wq = alloc_workqueue("tieredvol_wq", WQ_UNBOUND | WQ_HIGHPRI, 0);
+	if (!tv_wq) {
+		dm_unregister_target(&tieredvol_target);
+		pr_err("tieredvol: workqueue alloc failed\n");
+		return -ENOMEM;
+	}
+
+	pr_info("tieredvol: module loaded\n");
 	return 0;
 }
 
@@ -480,4 +440,4 @@ module_exit(tieredvol_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("TieredVol");
 MODULE_DESCRIPTION("Weighted striped dm target for tiered storage");
-MODULE_VERSION("3.0.0");
+MODULE_VERSION("4.2.0");

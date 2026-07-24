@@ -11,7 +11,6 @@
 #define TV_CHUNK_SIZE   (1UL << 20)
 #define TV_SECTOR_SHIFT 9
 #define TV_SECTOR_SIZE  (1 << TV_SECTOR_SHIFT)
-#define TV_IO_ERROR_THRESHOLD 15
 
 struct tieredvol_segment {
 	u64 logical_begin;
