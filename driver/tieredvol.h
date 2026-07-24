@@ -6,6 +6,7 @@
 #include <linux/atomic.h>
 #include <linux/ktime.h>
 #include <linux/timer.h>
+#include <linux/bio.h>
 
 #define TV_MAX_DISKS    16
 #define TV_MAX_SEGS     16

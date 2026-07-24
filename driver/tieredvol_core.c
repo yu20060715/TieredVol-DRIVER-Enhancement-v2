@@ -115,11 +115,6 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 	u64 logical;
 	struct tieredvol_map cur;
 
-	if (bio->bi_opf & REQ_PREFLUSH || bio->bi_opf & REQ_FUA) {
-		bio_endio(bio);
-		return DM_MAPIO_SUBMITTED;
-	}
-
 	logical = (u64)bio->bi_iter.bi_sector << SECTOR_SHIFT;
 
 	switch (ctx->policy) {
@@ -631,7 +626,6 @@ found:
 		pr_info("tieredvol: wear counters reset\n");
 		return 0;
 	}
-
 	return -EINVAL;
 }
 
