@@ -53,45 +53,47 @@
 
 ## 二、第二層：中等難度（借 pattern，3-5天一個）
 
-### 2.1 動態權重調整（核心功能）
+### 2.1 動態權重調整（核心功能） ✅ DONE
 - **來源**：`dm-ps-service-time.c` (lines 136-211)
 - **做法**：借 `st_compare_load()` 公式
 - **核心公式**：`service_time = (in_flight + incoming) / relative_throughput`
 - **優化**：用交叉相乘避免除法：`sz1 * pi2->relative_throughput < sz2 * pi1->relative_throughput`
-- **效果**：根據即時負載自動調整資料分佈
+- **實際做法**：`tv_map_logical_adaptive()` — 每個 segment 內選 EMA load 最低的 disk，全部 stale 時 fallback 到 static weights
 - **難度**：中
 
-### 2.2 Per-disk In-flight Tracking
+### 2.2 Per-disk In-flight Tracking ✅ DONE
 - **來源**：`dm-ps-service-time.c` (lines 197-215)
-- **做法**：`atomic_add(nr_bytes)` 在 map() 時，`atomic_sub(nr_bytes)` 在 end_io() 時
-- **效果**：追蹤每顆碟的即時負載
+- **做法**：DM strips bi_opf/bi_bdev between map() and end_io()，hash table 和 bi_opf encoding 都行不通
+- **實際做法**：map()-only `atomic_add(in_flight_bytes)`，timer callback 用 `atomic_xchg` snapshot 每秒
+- **效果**：近似 per-interval bytes sent per disk，用於 EMA 載入量
 - **難度**：低-中
 
-### 2.3 Timer 監控
+### 2.3 Timer 監控 ✅ DONE
 - **來源**：`dm-delay.c` (lines 29-58, 267-282)
-- **做法**：`timer_setup()` + `INIT_WORK()` + `alloc_workqueue()`
-- **teardown**：`timer_shutdown_sync()` + `destroy_workqueue()`
-- **效果**：定期檢查並調整權重
+- **做法**：`timer_setup()` + 1 秒 interval (`TV_DECAY_INTERVAL = HZ`)
+- **teardown**：`timer_delete_sync()` in dtr
+- **效果**：每秒 snapshot in_flight → EMA → staleness check
 - **難度**：中
 
-### 2.4 sysfs 即時控制
+### 2.4 sysfs 即時控制 ✅ DONE (via dmsetup message)
 - **來源**：`dm-delay.c` presuspend/resume pattern
-- **做法**：`module_param` + sysfs callback
+- **做法**：用 `dmsetup message` 接口而非 sysfs（更實際）
+- **Commands**: `show_inflight`, `adaptive_on`, `adaptive_off`, `show_adaptive`, `set_ema_shift <N>`, `set_stale_ms <N>`
 - **效果**：可即時開關動態調整、查看統計
 - **難度**：中
 
-### 2.5 EMA 延遲追蹤
+### 2.5 EMA 延遲追蹤 ✅ DONE
 - **來源**：`dm-ps-historical-service-time.c` (lines 105-118)
 - **做法**：`fixed_ema()` 追蹤歷史 service time
-- **公式**：`ema = last * weight + next * (1 - weight)`
-- **效果**：平滑延遲數據，避免抖動
+- **公式**：`ema = ema * (1 - alpha) + snapshot * alpha`，alpha = 1 << ema_weight_shift / 1024
+- **效果**：平滑載入數據，避免抖動
 - **難度**：中
 
-### 2.6 Staleness 偵測
+### 2.6 Staleness 偵測 ✅ DONE
 - **來源**：`dm-ps-historical-service-time.c` (lines 310-323)
-- **做法**：`stale_after` + `last_finish` 時間戳
-- **邏輯**：如果某碟 N 秒內沒完成任何 request → 標記 stale
-- **效果**：偵測故障或效能嚴重下降的磁碟
+- **做法**：`stale_after_ns` + `last_finish_ns` 時間戳 + cooldown recovery
+- **邏輯**：N 秒無 I/O → stale → adaptive 跳過 → cooldown 2x 後自動恢復
+- **Grace period**：恢復後 grace_until = now + stale_after 避免 oscillation
 - **難度**：中
 
 ---
@@ -141,8 +143,8 @@
 
 ## 五、執行順序
 
-1. **第一層**：先做 1.1-1.7（簡單增強，1天搞定）
-2. **第二層**：再做 2.1-2.6（動態權重是重點，1-2週）
+1. ~~**第一層**：先做 1.1-1.7~~ ✅ DONE (v4.3.0)
+2. ~~**第二層**：再做 2.1-2.6~~ ✅ DONE (v4.4.0)
 3. **第三層**：看需求決定要不要做 3.1-3.4（野心大的，1-2月）
 
 ---
@@ -154,3 +156,22 @@
 - 錯誤處理不能影響正常 I/O 效能（<1% overhead）
 - 所有新功能都要有 **單元測試**
 - 所有借鑒的 code 必須 **標註來源**
+
+---
+
+## 七、實作筆記
+
+### Tier 2: in-flight tracking 限制
+- DM 在 map() 和 end_io() 之間會 **stripped bi_opf bits** 和 **restore bi_bdev**，所以無法在 end_io 中識別 per-disk I/O
+- 嘗試過：hash table (bio->bi_iter hash)、bi_opf high bits encoding、sub-bios — 全部行不通
+- 最終方案：map()-only atomic counters + timer atomic_xchg snapshot
+- 效果：近似值，足夠做 load-balancing 決策
+
+### Staleness oscillation
+- 初始問題：cooldown 恢復後 → 無 I/O → 3s 後又 stale → 不斷循環
+- 修復：加 grace period (`grace_until_ns`) — 恢復後 grace = stale_after 內不再檢查
+- 生產建議：stale_after_ms 設 10-30s，避免短暫 idle 造成的 oscillation
+
+### v4.3.0 freeze bisect 結論
+- 5 個 feature group 全部獨立測試通過
+- freeze 原因：尚未確認，但 v4.3.0 穩定運行

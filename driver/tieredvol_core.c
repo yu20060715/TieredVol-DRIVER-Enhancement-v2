@@ -5,9 +5,19 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/percpu.h>
+#include <linux/timer.h>
+#include <linux/jiffies.h>
 #include "tieredvol.h"
 
 #define DM_MSG_PREFIX "tieredvol"
+
+/*
+ * Per-disk load tracking via map()-only counters with time-decay.
+ * We cannot reliably identify which disk a bio belongs to in end_io()
+ * because DM strips bi_opf and restores bi_bdev. Instead, we track
+ * "bytes recently sent" per disk and decay them over time.
+ * This is an approximation good enough for load-balancing decisions.
+ */
 
 static struct workqueue_struct *tv_wq;
 
@@ -49,15 +59,61 @@ static inline u64 tv_read_bytes(void)
 	return total;
 }
 
+#define TV_DECAY_INTERVAL (HZ)
+
+static void tv_decay_timer_fn(struct timer_list *timer)
+{
+	struct tieredvol_ctx *ctx = from_timer(ctx, timer, decay_timer);
+	u32 alpha_shift = ctx->ema_weight_shift;
+	u64 alpha = (alpha_shift < 10) ? (1ULL << alpha_shift) : 1024;
+	u64 one_minus_alpha = 1024 - alpha;
+	u64 now = ktime_get_boottime_ns();
+	int i;
+
+	for (i = 0; i < ctx->ndisks; i++) {
+		u64 snapshot = (u64)atomic_xchg(&ctx->in_flight_bytes[i], 0);
+
+		ctx->ema_load[i] = (ctx->ema_load[i] * one_minus_alpha +
+				    snapshot * alpha) >> 10;
+
+		ctx->last_interval_bytes[i] = snapshot;
+
+		if (ctx->stale_after_ns > 0 && snapshot > 0)
+			ctx->last_finish_ns[i] = now;
+
+		if (ctx->stale_after_ns > 0 &&
+		    !ctx->stale[i] &&
+		    ctx->last_finish_ns[i] > 0 &&
+		    now > ctx->grace_until_ns[i] &&
+		    (now - ctx->last_finish_ns[i]) > ctx->stale_after_ns) {
+			ctx->stale[i] = true;
+			ctx->stale_marked_ns[i] = now;
+			pr_info("tieredvol: disk[%d] %s STALE (no I/O for %llu ms)\n",
+				i, ctx->meta.disk_names[i],
+				(now - ctx->last_finish_ns[i]) / 1000000ULL);
+		} else if (ctx->stale[i] && snapshot > 0) {
+			ctx->stale[i] = false;
+			ctx->grace_until_ns[i] = now + ctx->stale_after_ns;
+			pr_info("tieredvol: disk[%d] %s RECOVERED (I/O resumed)\n",
+				i, ctx->meta.disk_names[i]);
+		} else if (ctx->stale[i] &&
+			   (now - ctx->stale_marked_ns[i]) >
+			   2 * ctx->stale_after_ns) {
+			ctx->stale[i] = false;
+			ctx->grace_until_ns[i] = now + ctx->stale_after_ns;
+			pr_info("tieredvol: disk[%d] %s RECOVERED (cooldown)\n",
+				i, ctx->meta.disk_names[i]);
+		}
+	}
+
+	mod_timer(&ctx->decay_timer, jiffies + TV_DECAY_INTERVAL);
+}
+
 static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 {
 	struct tieredvol_ctx *ctx = ti->private;
 	u64 logical;
 	struct tieredvol_map cur;
-
-	this_cpu_inc(tv_map_count);
-	this_cpu_add(tv_map_sectors, bio_sectors(bio));
-	this_cpu_add(tv_map_bytes, bio->bi_iter.bi_size);
 
 	if (bio->bi_opf & REQ_PREFLUSH || bio->bi_opf & REQ_FUA) {
 		bio_endio(bio);
@@ -65,7 +121,13 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 	}
 
 	logical = (u64)bio->bi_iter.bi_sector << SECTOR_SHIFT;
-	cur = tv_map_logical(logical, &ctx->meta);
+
+	if (ctx->adaptive_enabled)
+		cur = tv_map_logical_adaptive(logical, &ctx->meta,
+					      ctx->ema_load, ctx->stale,
+					      ctx->ndisks);
+	else
+		cur = tv_map_logical(logical, &ctx->meta);
 
 	if (cur.disk < 0 || cur.disk >= ctx->ndisks) {
 		pr_err("tieredvol: map failed for sector %llu\n",
@@ -76,15 +138,16 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 
 	bio_set_dev(bio, ctx->devs[cur.disk]->bdev);
 	bio->bi_iter.bi_sector = cur.offset >> SECTOR_SHIFT;
+	atomic_add(bio->bi_iter.bi_size, &ctx->in_flight_bytes[cur.disk]);
+	this_cpu_inc(tv_map_count);
+	this_cpu_add(tv_map_sectors, bio_sectors(bio));
+	this_cpu_add(tv_map_bytes, bio->bi_iter.bi_size);
 	return DM_MAPIO_REMAPPED;
 }
 
 static int tieredvol_end_io(struct dm_target *ti, struct bio *bio,
 			    blk_status_t *error)
 {
-	/*
-	 * TODO: Implement error tracking using sub-bios if needed.
-	 */
 	return 0;
 }
 
@@ -150,6 +213,13 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 
 	INIT_WORK(&ctx->trigger_event, trigger_event);
 
+	ctx->adaptive_enabled = false;
+	ctx->ema_weight_shift = 3;
+	ctx->stale_after_ns = 5000000000ULL;
+
+	timer_setup(&ctx->decay_timer, tv_decay_timer_fn, 0);
+	mod_timer(&ctx->decay_timer, jiffies + TV_DECAY_INTERVAL);
+
 	for (i = 0; i < ctx->ndisks; i++)
 		pr_info("tieredvol: disk[%d] %s -> %pg (%llu sectors)\n",
 			i, ctx->meta.disk_names[i], ctx->devs[i]->bdev,
@@ -195,7 +265,7 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 		if (global_min_chunk == (sector_t)-1 || global_min_chunk == 0) {
 			ti->error = "tieredvol: invalid chunk geometry";
 			ret = -EINVAL;
-			goto put_devices;
+			goto free_error_count;
 		}
 
 		ctx->min_chunk_sectors = global_min_chunk;
@@ -245,6 +315,7 @@ static void tieredvol_dtr(struct dm_target *ti)
 	struct tieredvol_ctx *ctx = ti->private;
 	int i;
 
+	timer_delete_sync(&ctx->decay_timer);
 	flush_work(&ctx->trigger_event);
 	kfree(ctx->error_count);
 
@@ -383,6 +454,74 @@ found:
 					"disk[%d]=%s(w=%u) ",
 					i, ctx->meta.disk_names[i], w);
 		}
+		return 0;
+	}
+	if (argc == 1 && strcmp(argv[0], "show_inflight") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+		int i, off = 0;
+
+		for (i = 0; i < ctx->ndisks && off < (int)maxlen - 1; i++) {
+			off += snprintf(result + off, maxlen - off,
+					"%s%s=%u", i > 0 ? " " : "",
+					ctx->meta.disk_names[i],
+					atomic_read(&ctx->in_flight_bytes[i]));
+		}
+		pr_info("tieredvol: %s\n", result);
+		return 0;
+	}
+	if (argc == 1 && strcmp(argv[0], "adaptive_on") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+
+		ctx->adaptive_enabled = true;
+		pr_info("tieredvol: adaptive weights ENABLED\n");
+		return 0;
+	}
+	if (argc == 1 && strcmp(argv[0], "adaptive_off") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+
+		ctx->adaptive_enabled = false;
+		pr_info("tieredvol: adaptive weights DISABLED\n");
+		return 0;
+	}
+	if (argc == 2 && strcmp(argv[0], "set_ema_shift") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+		u32 shift;
+
+		if (kstrtou32(argv[1], 10, &shift) || shift > 10)
+			return -EINVAL;
+		ctx->ema_weight_shift = shift;
+		pr_info("tieredvol: ema_weight_shift=%u (alpha=%u/1024)\n",
+			shift, 1 << shift);
+		return 0;
+	}
+	if (argc == 2 && strcmp(argv[0], "set_stale_ms") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+		u32 ms;
+
+		if (kstrtou32(argv[1], 10, &ms))
+			return -EINVAL;
+		ctx->stale_after_ns = (u64)ms * 1000000ULL;
+		pr_info("tieredvol: stale_after=%ums\n", ms);
+		return 0;
+	}
+	if (argc == 1 && strcmp(argv[0], "show_adaptive") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+		int i, off = 0;
+
+		off += snprintf(result + off, maxlen - off,
+				"enabled=%d ema_shift=%u stale_ms=%llu",
+				ctx->adaptive_enabled,
+				ctx->ema_weight_shift,
+				ctx->stale_after_ns / 1000000ULL);
+		for (i = 0; i < ctx->ndisks && off < (int)maxlen - 1; i++) {
+			off += snprintf(result + off, maxlen - off,
+					" %s:load=%llu inflight=%u stale=%d",
+					ctx->meta.disk_names[i],
+					ctx->ema_load[i],
+					atomic_read(&ctx->in_flight_bytes[i]),
+					ctx->stale[i]);
+		}
+		pr_info("tieredvol: %s\n", result);
 		return 0;
 	}
 
