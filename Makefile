@@ -62,7 +62,9 @@ test: test_common test_mapper test_partition test_metadata
 	echo "=== test_metadata ===" && ./test_metadata
 
 test-full: test
-	@echo "Kernel module integration tests will be added in Phase 2"
+	@echo "=== Integration tests (DM messages) ==="
+	@echo "  Requires: sudo + running dm target. Run:"
+	@echo "  sudo ./tests/test_dm_messages.sh <volume_name>"
 
 # Kernel module targets
 module:

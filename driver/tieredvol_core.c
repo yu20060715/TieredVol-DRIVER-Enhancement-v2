@@ -181,7 +181,7 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 			struct bio *clone;
 
 			clone = bio_alloc_clone(ctx->devs[seg->mirror_disk]->bdev,
-						bio, GFP_NOIO, NULL);
+						bio, GFP_NOIO, &fs_bio_set);
 			if (clone) {
 				clone->bi_iter.bi_sector = cur.offset >> SECTOR_SHIFT;
 				clone->bi_private = ctx;
@@ -567,7 +567,7 @@ found:
 		pr_info("tieredvol: policy = %s\n", argv[1]);
 		return 0;
 	}
-	if (argc == 1 && strcmp(argv[0], "set_ema_shift") == 0) {
+	if (argc == 2 && strcmp(argv[0], "set_ema_shift") == 0) {
 		struct tieredvol_ctx *ctx = ti->private;
 		u32 shift;
 

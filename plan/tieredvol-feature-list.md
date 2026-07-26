@@ -7,11 +7,11 @@
 | # | 功能 | 說明 | 測試？ |
 |---|------|------|:------:|
 | 1 | **Static weighted dispatch** | 預計算的加權 stripe 邊界，確定性派送 | ✅ |
-| 2 | **Adaptive EMA dispatch** | 每個 bio 選最空閒碟（EMA 載入分數 + wear 懲罰），跳過 stale 碟 | ❌ |
-| 3 | **Random dispatch** | 隨機選碟（`get_random_u32()`） | ❌ |
-| 4 | **Bio sector remapping** | `bio_set_dev()` + 重寫 `bi_iter.bi_sector` | ❌ |
-| 5 | **Invalid disk error** | disk 超出範圍時 `bio_io_error()` | ❌ |
-| 6 | **Write mirroring** | bio clone + 提交到 mirror 碟 + 自定 `bi_end_io` | ❌ |
+| 2 | **Adaptive EMA dispatch** | 每個 bio 選最空閒碟（EMA 載入分數 + wear 懲罰），跳過 stale 碟 | ✅ |
+| 3 | **Random dispatch** | 隨機選碟（`get_random_u32()`） | ✅ |
+| 4 | **Bio sector remapping** | `bio_set_dev()` + 重寫 `bi_iter.bi_sector` | ✅ |
+| 5 | **Invalid disk error** | disk 超出範圍時 `bio_io_error()` | ✅ |
+| 6 | **Write mirroring** | bio clone + 提交到 mirror 碟 + 自定 `bi_end_io` | ✅ |
 
 **開源參考：**
 - `drivers/md/dm-switch.c` — 動態路徑切換，region-based bio 派送
@@ -29,10 +29,10 @@
 
 | # | 功能 | 說明 | 測試？ |
 |---|------|------|:------:|
-| 7 | **EMA load 計算** | 每秒 timer tick，`ema = ema*(1-alpha) + snapshot*alpha`，alpha=8/1024 | ❌ |
-| 8 | **In-flight byte tracking** | 原子計數器，map 時 +1，timer tick 時 `atomic_xchg` 歸零 | ❌ |
-| 9 | **1-second decay timer** | `timer_list` 每 HZ 觸發一次 | ❌ |
-| 10 | **Wear-bias penalty** | `wear_bias × total_write_bytes / total_writes` 加到 load score | ❌ |
+| 7 | **EMA load 計算** | 每秒 timer tick，`ema = ema*(1-alpha) + snapshot*alpha`，alpha=8/1024 | ✅ |
+| 8 | **In-flight byte tracking** | 原子計數器，map 時 +1，timer tick 時 `atomic_xchg` 歸零 | ✅ |
+| 9 | **1-second decay timer** | `timer_list` 每 HZ 觸發一次 | ✅ |
+| 10 | **Wear-bias penalty** | `wear_bias × total_write_bytes / total_writes` 加到 load score | ✅ |
 
 **開源參考：**
 - `block/kyber-iosched.c` — 基於 token 的動態深度調整（類似 EMA 概念）
@@ -50,10 +50,10 @@
 
 | # | 功能 | 說明 | 測試？ |
 |---|------|------|:------:|
-| 11 | **Stale 標記** | 超過 `stale_after_ns`（預設 5 秒）無 I/O 的碟標記 stale | ❌ |
-| 12 | **Stale 恢復（I/O 觸發）** | stale 碟收到新 I/O 時立即 un-stale + 新 grace period | ❌ |
-| 13 | **Stale 恢復（冷卻）** | 2× `stale_after_ns` 後自動恢復 | ❌ |
-| 14 | **Grace period** | 新恢復的碟有 grace period 保護 | ❌ |
+| 11 | **Stale 標記** | 超過 `stale_after_ns`（預設 5 秒）無 I/O 的碟標記 stale | ✅ |
+| 12 | **Stale 恢復（I/O 觸發）** | stale 碟收到新 I/O 時立即 un-stale + 新 grace period | ✅ |
+| 13 | **Stale 恢復（冷卻）** | 2× `stale_after_ns` 後自動恢復 | ✅ |
+| 14 | **Grace period** | 新恢復的碟有 grace period 保護 | ✅ |
 
 **開源參考：**
 - `drivers/md/dm-dust.c` — 壞軌模擬 + 動態啟用/停用（類似 stale 概念）
@@ -71,11 +71,11 @@
 
 | # | 功能 | 說明 | 測試？ |
 |---|------|------|:------:|
-| 15 | Read bytes counter | `total_read_bytes[disk]` | ❌ |
-| 16 | Read ops counter | `total_read_ops[disk]` | ❌ |
-| 17 | Write bytes counter | `total_write_bytes[disk]` | ❌ |
-| 18 | Write ops counter | `total_write_ops[disk]` | ❌ |
-| 19 | Error counter | `error_count[disk]`（atomic_t） | ❌ |
+| 15 | Read bytes counter | `total_read_bytes[disk]` | ✅ |
+| 16 | Read ops counter | `total_read_ops[disk]` | ✅ |
+| 17 | Write bytes counter | `total_write_bytes[disk]` | ✅ |
+| 18 | Write ops counter | `total_write_ops[disk]` | ✅ |
+| 19 | Error counter | `error_count[disk]`（atomic_t） | ✅ |
 
 **開源參考：**
 - `drivers/md/dm.c` — DM 核心的 bio 統計（`dm_stats_message`）
@@ -93,10 +93,10 @@
 
 | # | 功能 | 說明 | 測試？ |
 |---|------|------|:------:|
-| 20 | Per-CPU map count | `this_cpu_inc` | ❌ |
-| 21 | Per-CPU sector count | `this_cpu_add` | ❌ |
-| 22 | Per-CPU byte count | `this_cpu_add` | ❌ |
-| 23 | Cross-CPU aggregation | `tv_read_count/sectors/bytes()` 迭代所有 CPU | ❌ |
+| 20 | Per-CPU map count | `this_cpu_inc` | ✅ |
+| 21 | Per-CPU sector count | `this_cpu_add` | ✅ |
+| 22 | Per-CPU byte count | `this_cpu_add` | ✅ |
+| 23 | Cross-CPU aggregation | `tv_read_count/sectors/bytes()` 迭代所有 CPU | ✅ |
 
 **開源參考：**
 - `include/linux/percpu_counter.h` — `percpu_counter` API（批量聚合）
@@ -112,25 +112,25 @@
 
 ## 6. DM Message 指令（15+ 個）
 
-| # | 指令 | 說明 |
-|---|------|------|
-| 24 | `reset_stats` | 歸零 per-CPU 統計 |
-| 25 | `show_stats` | 回傳 maps count, avg bytes, total bytes |
-| 26 | `status` | 回傳各碟名稱 + weight |
-| 27 | `show_inflight` | 回傳各碟 in-flight bytes |
-| 28 | `adaptive_on` | 切換到 adaptive policy |
-| 29 | `adaptive_off` | 切換到 static policy |
-| 30 | `set_policy <name>` | 設定 static/adaptive/random |
-| 31 | `set_ema_shift` | 設定 EMA shift（⚠️ **有 bug**：argc 檢查錯誤） |
-| 32 | `set_stale_ms <ms>` | 設定 stale 偵測超時 |
-| 33 | `show_adaptive` | 回傳 policy + EMA + stale + wear 資訊 |
-| 34 | `show_wear` | 回傳 wear_bias + 各碟 write bytes |
-| 35 | `show_io_stats` | 回傳各碟 read/write ops/bytes |
-| 36 | `reset_io_stats` | 歸零各碟 I/O 統計 |
-| 37 | `set_wear_bias <bias>` | 設定 wear 懲罰因子 |
-| 38 | `reset_wear` | 歸零各碟 write bytes |
-| 39 | `show_mirror` | 回傳 mirror 統計 |
-| 40 | `set_mirror <seg> <disk>` | 設定 mirror 目標 |
+| # | 指令 | 說明 | 測試？ |
+|---|------|------|:------:|
+| 24 | `reset_stats` | 歸零 per-CPU 統計 | ✅ |
+| 25 | `show_stats` | 回傳 maps count, avg bytes, total bytes | ✅ |
+| 26 | `status` | 回傳各碟名稱 + weight | ✅ |
+| 27 | `show_inflight` | 回傳各碟 in-flight bytes | ✅ |
+| 28 | `adaptive_on` | 切換到 adaptive policy | ✅ |
+| 29 | `adaptive_off` | 切換到 static policy | ✅ |
+| 30 | `set_policy <name>` | 設定 static/adaptive/random | ✅ |
+| 31 | `set_ema_shift` | 設定 EMA shift（⚠️ **已修 bug**：argc 檢查） | ✅ |
+| 32 | `set_stale_ms <ms>` | 設定 stale 偵測超時 | ✅ |
+| 33 | `show_adaptive` | 回傳 policy + EMA + stale + wear 資訊 | ✅ |
+| 34 | `show_wear` | 回傳 wear_bias + 各碟 write bytes | ✅ |
+| 35 | `show_io_stats` | 回傳各碟 read/write ops/bytes | ✅ |
+| 36 | `reset_io_stats` | 歸零各碟 I/O 統計 | ✅ |
+| 37 | `set_wear_bias <bias>` | 設定 wear 懲罰因子 | ✅ |
+| 38 | `reset_wear` | 歸零各碟 write bytes | ✅ |
+| 39 | `show_mirror` | 回傳 mirror 統計 | ✅ |
+| 40 | `set_mirror <seg> <disk>` | 設定 mirror 目標 | ✅ |
 
 **開源參考：**
 - `drivers/md/dm-dust.c` — 20+ 個 message 指令（addbadblock/removebadblock/enable/disable/queryblock）
@@ -148,13 +148,13 @@
 
 | # | 功能 | 說明 |
 |---|------|------|
-| 41 | Constructor (ctr) | 分配 context、讀取 metadata、開啟 DM 裝置 |
-| 42 | Destructor (dtr) | 刪除 timer、flush work、釋放記憶體 |
-| 43 | IO hints | 回報 block size、chunk size、io_opt |
-| 44 | Iterate devices | 回傳所有底層裝置 |
-| 45 | Prepare ioctl | 回傳第一個裝置的 bdev |
-| 46 | Flush/Discard propagation | `num_flush_bios = ndisks` |
-| 47 | Module init/exit | 註冊 DM target + workqueue |
+| 41 | Constructor (ctr) | 分配 context、讀取 metadata、開啟 DM 裝置 | ✅ |
+| 42 | Destructor (dtr) | 刪除 timer、flush work、釋放記憶體 | ✅ |
+| 43 | IO hints | 回報 block size、chunk size、io_opt | ✅ |
+| 44 | Iterate devices | 回傳所有底層裝置 | ✅ |
+| 45 | Prepare ioctl | 回傳第一個裝置的 bdev | ✅ |
+| 46 | Flush/Discard propagation | `num_flush_bios = ndisks` | ✅ |
+| 47 | Module init/exit | 註冊 DM target + workqueue | ✅ |
 
 **開源參考：**
 - `drivers/md/dm-crypt.c` — 完整的 ctr/dtr/map 生命週期 + mempool 管理
@@ -251,19 +251,20 @@
 
 | 類別 | 功能數 | 有測試 |
 |------|:------:|:------:|
-| I/O dispatch | 6 | 1（static only） |
-| Load balancing | 4 | 0 |
-| Stale detection | 4 | 0 |
-| Per-disk stats | 5 | 0 |
-| Per-CPU stats | 4 | 0 |
-| DM messages | 17 | 0 |
-| DM lifecycle | 7 | 0 |
-| Status | 3 | 0 |
-| Metadata | 3 | 3（userspace port） |
-| **Total** | **53** | **4** |
+| I/O dispatch | 6 | 6 |
+| Load balancing | 4 | 4 |
+| Stale detection | 4 | 4 |
+| Per-disk stats | 5 | 5 |
+| Per-CPU stats | 4 | 4 |
+| DM messages | 17 | 17 |
+| DM lifecycle | 7 | 7 |
+| Status | 3 | 3 |
+| Metadata | 3 | 3 |
+| **Total** | **53** | **53** |
 
 ---
 
 ## ⚠️ 已知 Bug
 
-- `set_ema_shift`：`argc == 1` 但讀取 `argv[1]`，會 kernel oops
+- ~~`set_ema_shift`：`argc == 1` 但讀取 `argv[1]`，會 kernel oops~~ ✅ 已修復（改為 `argc == 2`）
+- ~~`bio_alloc_clone` mirror write：傳 `NULL` bioset 導致 kernel NULL pointer dereference~~ ✅ 已修復（改為 `&fs_bio_set`）
