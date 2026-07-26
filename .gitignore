@@ -28,3 +28,4 @@ driver/..module-common.o.cmd
 # OS
 .DS_Store
 Thumbs.db
+tests/dm_msg
