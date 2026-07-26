@@ -328,6 +328,16 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 		goto free_error_count;
 	}
 
+	/* Validate segments are sorted by logical_begin (required for binary search) */
+	for (i = 1; i < (int)ctx->meta.segment_count; i++) {
+		if (ctx->meta.segments[i].logical_begin <
+		    ctx->meta.segments[i - 1].logical_begin) {
+			ti->error = "tieredvol: segments not sorted by logical_begin";
+			ret = -EINVAL;
+			goto free_error_count;
+		}
+	}
+
 	/* Compute min_chunk_sectors and stripe_sectors across all segments.
 	 * min_chunk = min over all segments of (min weight * TV_CHUNK_SIZE).
 	 * dm_set_target_max_io_len() ensures dm core splits bios so they

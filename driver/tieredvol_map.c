@@ -1,6 +1,28 @@
 #include "tieredvol.h"
 #include <linux/random.h>
 
+/* Binary search for segment containing logical byte offset.
+ * Segments must be sorted by logical_begin (validated in constructor).
+ * Returns segment index, or -1 if not found.
+ */
+static int tv_find_segment(u64 logical, const struct tieredvol_metadata *meta)
+{
+	int lo = 0, hi = (int)meta->segment_count - 1;
+
+	while (lo <= hi) {
+		int mid = (lo + hi) / 2;
+		const struct tieredvol_segment *seg = &meta->segments[mid];
+
+		if (logical < seg->logical_begin)
+			hi = mid - 1;
+		else if (logical >= seg->logical_end)
+			lo = mid + 1;
+		else
+			return mid;
+	}
+	return -1;
+}
+
 struct tieredvol_map tv_map_logical(u64 logical,
 				    struct tieredvol_metadata *meta)
 {
@@ -14,15 +36,7 @@ struct tieredvol_map tv_map_logical(u64 logical,
 	if (!meta || meta->segment_count == 0)
 		return err;
 
-	seg_idx = -1;
-	for (i = 0; i < (int)meta->segment_count; i++) {
-		if (logical >= meta->segments[i].logical_begin &&
-		    logical <  meta->segments[i].logical_end) {
-			seg_idx = i;
-			break;
-		}
-	}
-
+	seg_idx = tv_find_segment(logical, meta);
 	if (seg_idx < 0)
 		return err;
 
@@ -83,15 +97,7 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 	if (!meta || meta->segment_count == 0)
 		return err;
 
-	seg_idx = -1;
-	for (i = 0; i < (int)meta->segment_count; i++) {
-		if (logical >= meta->segments[i].logical_begin &&
-		    logical <  meta->segments[i].logical_end) {
-			seg_idx = i;
-			break;
-		}
-	}
-
+	seg_idx = tv_find_segment(logical, meta);
 	if (seg_idx < 0)
 		return err;
 
@@ -167,13 +173,8 @@ struct tieredvol_map tv_map_logical_random(u64 logical,
 	if (!meta || meta->segment_count == 0)
 		return err;
 
-	for (seg_idx = 0; seg_idx < (int)meta->segment_count; seg_idx++) {
-		if (logical >= meta->segments[seg_idx].logical_begin &&
-		    logical <  meta->segments[seg_idx].logical_end)
-			break;
-	}
-
-	if (seg_idx >= (int)meta->segment_count)
+	seg_idx = tv_find_segment(logical, meta);
+	if (seg_idx < 0)
 		return err;
 
 	seg = &meta->segments[seg_idx];
