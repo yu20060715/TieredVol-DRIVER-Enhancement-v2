@@ -158,6 +158,108 @@ static void tv_mirror_end_io(struct bio *bio)
 	bio_put(bio);
 }
 
+/*
+ * Pending-read tracking for mirror read fallback (1c).
+ * In tieredvol_map(), for READ bios on mirrored segments, we record the
+ * mapping so end_io can resubmit to the mirror on error.
+ */
+struct tv_pending_read {
+	struct block_device *bdev;
+	sector_t sector;
+	unsigned int size;
+	int mirror_disk;
+};
+
+#define TV_PENDING_MAX 64
+static struct tv_pending_read tv_pending_reads[TV_PENDING_MAX];
+static unsigned int tv_pending_head;
+static unsigned int tv_pending_count;
+static DEFINE_SPINLOCK(tv_pending_lock);
+
+static void tv_pending_add(struct block_device *bdev, sector_t sector,
+			   unsigned int size, int mirror_disk)
+{
+	unsigned long flags;
+	unsigned int idx;
+
+	spin_lock_irqsave(&tv_pending_lock, flags);
+	idx = (tv_pending_head + tv_pending_count) % TV_PENDING_MAX;
+	if (tv_pending_count < TV_PENDING_MAX) {
+		tv_pending_reads[idx].bdev = bdev;
+		tv_pending_reads[idx].sector = sector;
+		tv_pending_reads[idx].size = size;
+		tv_pending_reads[idx].mirror_disk = mirror_disk;
+		tv_pending_count++;
+	}
+	spin_unlock_irqrestore(&tv_pending_lock, flags);
+}
+
+static int tv_pending_find_and_remove(struct block_device *bdev, sector_t sector,
+				     unsigned int size)
+{
+	unsigned long flags;
+	int mirror_disk = -1;
+	unsigned int i;
+
+	spin_lock_irqsave(&tv_pending_lock, flags);
+	for (i = 0; i < tv_pending_count; i++) {
+		unsigned int idx = (tv_pending_head + i) % TV_PENDING_MAX;
+		struct tv_pending_read *pr = &tv_pending_reads[idx];
+
+		if (pr->bdev == bdev && pr->sector == sector && pr->size == size) {
+			mirror_disk = pr->mirror_disk;
+			/* Shift remaining entries down */
+			unsigned int j;
+
+			for (j = i; j + 1 < tv_pending_count; j++) {
+				unsigned int next = (tv_pending_head + j + 1) % TV_PENDING_MAX;
+
+				tv_pending_reads[(tv_pending_head + j) % TV_PENDING_MAX] =
+					tv_pending_reads[next];
+			}
+			tv_pending_count--;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&tv_pending_lock, flags);
+	return mirror_disk;
+}
+
+struct tv_retry_ctx {
+	struct work_struct work;
+	struct tieredvol_ctx *ctx;
+	sector_t sector;
+	unsigned int size;
+	int mirror_disk;
+};
+
+static void tv_read_retry_work(struct work_struct *work)
+{
+	struct tv_retry_ctx *rc = container_of(work, struct tv_retry_ctx, work);
+	struct bio *clone;
+
+	clone = bio_alloc(rc->ctx->devs[rc->mirror_disk]->bdev,
+			  1, REQ_OP_READ, GFP_NOIO);
+	if (!clone) {
+		tv_log(TV_LOG_ERR, rc->mirror_disk, TV_LOG_MIRROR,
+		       "retry alloc failed sec=%llu", (u64)rc->sector);
+		goto out;
+	}
+
+	clone->bi_iter.bi_sector = rc->sector;
+	clone->bi_iter.bi_size = rc->size;
+	clone->bi_end_io = tv_mirror_end_io;
+	clone->bi_private = rc->ctx;
+
+	submit_bio(clone);
+	tv_log(TV_LOG_INFO, rc->mirror_disk, TV_LOG_MIRROR,
+	       "retry read -> disk%d sec=%llu",
+	       rc->mirror_disk, (u64)rc->sector);
+
+out:
+	kfree(rc);
+}
+
 static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 {
 	struct tieredvol_ctx *ctx = ti->private;
@@ -242,12 +344,71 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 		}
 	}
 
+	/* Mirror read fallback (1c): record pending read for retry on error */
+	if (bio_data_dir(bio) == READ &&
+	    cur.seg_idx >= 0 &&
+	    cur.seg_idx < (int)ctx->meta.segment_count) {
+		struct tieredvol_segment *seg =
+			&ctx->meta.segments[cur.seg_idx];
+
+		if (seg->mirror_enabled &&
+		    seg->mirror_disk < (u32)ctx->ndisks &&
+		    seg->mirror_disk != (u32)cur.disk) {
+			tv_pending_add(ctx->devs[cur.disk]->bdev,
+				       bio->bi_iter.bi_sector,
+				       bio->bi_iter.bi_size,
+				       (int)seg->mirror_disk);
+		}
+	}
+
 	return DM_MAPIO_REMAPPED;
 }
 
 static int tieredvol_end_io(struct dm_target *ti, struct bio *bio,
 			    blk_status_t *error)
 {
+	struct tieredvol_ctx *ctx = ti->private;
+
+	if (bio->bi_status != BLK_STS_OK) {
+		int i;
+
+		for (i = 0; i < ctx->ndisks; i++) {
+			if (bio->bi_bdev == ctx->devs[i]->bdev) {
+				atomic_inc(&ctx->error_count[i]);
+				tv_log(TV_LOG_ERR, i, TV_LOG_IO,
+				       "I/O error on %s status=%d",
+				       ctx->meta.disk_names[i],
+				       bio->bi_status);
+
+				/* Mirror read fallback (1c) */
+				if (bio_data_dir(bio) == READ) {
+					int mirror = tv_pending_find_and_remove(
+						bio->bi_bdev,
+						bio->bi_iter.bi_sector,
+						bio->bi_iter.bi_size);
+
+					if (mirror >= 0 && mirror < ctx->ndisks) {
+						struct tv_retry_ctx *rc;
+
+						rc = kmalloc(sizeof(*rc), GFP_ATOMIC);
+						if (rc) {
+							INIT_WORK(&rc->work, tv_read_retry_work);
+							rc->ctx = ctx;
+							rc->sector = bio->bi_iter.bi_sector;
+							rc->size = bio->bi_iter.bi_size;
+							rc->mirror_disk = mirror;
+							schedule_work(&rc->work);
+							tv_log(TV_LOG_INFO, i, TV_LOG_MIRROR,
+							       "scheduling read retry -> disk%d",
+							       mirror);
+						}
+					}
+				}
+				break;
+			}
+		}
+	}
+
 	return 0;
 }
 
@@ -822,6 +983,28 @@ found:
 			return -EINVAL;
 		tv_log_level = lvl;
 		pr_info("tieredvol: loglevel = %u\n", tv_log_level);
+		return 0;
+	}
+	if (argc == 1 && strcmp(argv[0], "show_errors") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+		int i, off = 0;
+
+		for (i = 0; i < ctx->ndisks && off < (int)maxlen - 2; i++) {
+			off += snprintf(result + off, maxlen - off,
+					"%s%s=%d", i > 0 ? " " : "",
+					ctx->meta.disk_names[i],
+					atomic_read(&ctx->error_count[i]));
+		}
+		return 0;
+	}
+	if (argc == 1 && strcmp(argv[0], "reset_errors") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+		int i;
+
+		for (i = 0; i < ctx->ndisks; i++)
+			atomic_set(&ctx->error_count[i], 0);
+		pr_info("tieredvol: error counts reset\n");
+		tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "errors reset");
 		return 0;
 	}
 	return -EINVAL;
