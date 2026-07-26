@@ -8,9 +8,16 @@
 #include <linux/timer.h>
 #include <linux/jiffies.h>
 #include <linux/kfifo.h>
+#include <linux/sysfs.h>
 #include "tieredvol.h"
 
 #define DM_MSG_PREFIX "tieredvol"
+
+static void tv_sysfs_init(void);
+static void tv_sysfs_exit(void);
+
+static struct kobject *tv_kobj;
+static struct tieredvol_ctx *tv_active_ctx;
 
 /*
  * Per-disk load tracking via map()-only counters with time-decay.
@@ -572,6 +579,7 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 	ti->flush_bypasses_map = true;
 
 	ti->private = ctx;
+	tv_active_ctx = ctx;
 	return 0;
 
 free_error_count:
@@ -601,6 +609,8 @@ static void tieredvol_dtr(struct dm_target *ti)
 
 	kfree(ctx->devs);
 	kfree(ctx->disk_sectors);
+	if (tv_active_ctx == ctx)
+		tv_active_ctx = NULL;
 	kfree(ctx);
 }
 
@@ -1059,12 +1069,204 @@ static int __init tieredvol_init(void)
 		return -ENOMEM;
 	}
 
+	tv_sysfs_init();
 	pr_info("tieredvol: module loaded (log_size=%u)\n", log_size);
 	return 0;
 }
 
+/* ===== sysfs attributes (4a) ===== */
+
+static ssize_t policy_show(struct kobject *kobj, struct kobj_attribute *attr,
+			   char *buf)
+{
+	struct tieredvol_ctx *ctx = tv_active_ctx;
+
+	if (!ctx)
+		return -ENODEV;
+	return sysfs_emit(buf, "%s\n",
+			  ctx->policy == TV_POLICY_ADAPTIVE ? "adaptive" :
+			  ctx->policy == TV_POLICY_RANDOM ? "random" : "static");
+}
+
+static ssize_t stale_ms_show(struct kobject *kobj, struct kobj_attribute *attr,
+			     char *buf)
+{
+	struct tieredvol_ctx *ctx = tv_active_ctx;
+
+	if (!ctx)
+		return -ENODEV;
+	return sysfs_emit(buf, "%llu\n", ctx->stale_after_ns / 1000000ULL);
+}
+
+static ssize_t stale_ms_store(struct kobject *kobj, struct kobj_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct tieredvol_ctx *ctx = tv_active_ctx;
+	u32 ms;
+
+	if (!ctx)
+		return -ENODEV;
+	if (kstrtou32(buf, 10, &ms))
+		return -EINVAL;
+	ctx->stale_after_ns = (u64)ms * 1000000ULL;
+	return count;
+}
+
+static ssize_t wear_bias_show(struct kobject *kobj, struct kobj_attribute *attr,
+			      char *buf)
+{
+	struct tieredvol_ctx *ctx = tv_active_ctx;
+
+	if (!ctx)
+		return -ENODEV;
+	return sysfs_emit(buf, "%u\n", ctx->wear_bias);
+}
+
+static ssize_t wear_bias_store(struct kobject *kobj, struct kobj_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct tieredvol_ctx *ctx = tv_active_ctx;
+	u32 bias;
+
+	if (!ctx)
+		return -ENODEV;
+	if (kstrtou32(buf, 10, &bias) || bias > 1024)
+		return -EINVAL;
+	ctx->wear_bias = bias;
+	return count;
+}
+
+static ssize_t ema_shift_show(struct kobject *kobj, struct kobj_attribute *attr,
+			      char *buf)
+{
+	struct tieredvol_ctx *ctx = tv_active_ctx;
+
+	if (!ctx)
+		return -ENODEV;
+	return sysfs_emit(buf, "%u\n", ctx->ema_weight_shift);
+}
+
+static ssize_t ema_shift_store(struct kobject *kobj, struct kobj_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct tieredvol_ctx *ctx = tv_active_ctx;
+	u32 shift;
+
+	if (!ctx)
+		return -ENODEV;
+	if (kstrtou32(buf, 10, &shift) || shift > 10)
+		return -EINVAL;
+	ctx->ema_weight_shift = shift;
+	return count;
+}
+
+static ssize_t loglevel_show(struct kobject *kobj, struct kobj_attribute *attr,
+			     char *buf)
+{
+	return sysfs_emit(buf, "%u\n", tv_log_level);
+}
+
+static ssize_t loglevel_store(struct kobject *kobj, struct kobj_attribute *attr,
+			      const char *buf, size_t count)
+{
+	u32 lvl;
+
+	if (kstrtou32(buf, 10, &lvl) || lvl > TV_LOG_INFO)
+		return -EINVAL;
+	tv_log_level = lvl;
+	return count;
+}
+
+static ssize_t disk_count_show(struct kobject *kobj, struct kobj_attribute *attr,
+			       char *buf)
+{
+	struct tieredvol_ctx *ctx = tv_active_ctx;
+
+	if (!ctx)
+		return -ENODEV;
+	return sysfs_emit(buf, "%d\n", ctx->ndisks);
+}
+
+static ssize_t status_show(struct kobject *kobj, struct kobj_attribute *attr,
+			   char *buf)
+{
+	struct tieredvol_ctx *ctx = tv_active_ctx;
+	int i, off = 0;
+
+	if (!ctx)
+		return -ENODEV;
+
+	off += sysfs_emit_at(buf, off,
+			     "policy=%d mirror=%llu/%llu err=%llu\n",
+			     ctx->policy,
+			     ctx->mirror_write_ops,
+			     ctx->mirror_write_bytes,
+			     ctx->mirror_errors);
+
+	for (i = 0; i < ctx->ndisks; i++) {
+		off += sysfs_emit_at(buf, off,
+				     "%s: err=%d rd=%llu/%llu wr=%llu/%llu stale=%d ema=%llu\n",
+				     ctx->meta.disk_names[i],
+				     atomic_read(&ctx->error_count[i]),
+				     ctx->total_read_ops[i],
+				     ctx->total_read_bytes[i],
+				     ctx->total_write_ops[i],
+				     ctx->total_write_bytes[i],
+				     ctx->stale[i],
+				     ctx->ema_load[i]);
+	}
+	return off;
+}
+
+static struct kobj_attribute policy_attr = __ATTR_RO(policy);
+static struct kobj_attribute stale_ms_attr = __ATTR_RW(stale_ms);
+static struct kobj_attribute wear_bias_attr = __ATTR_RW(wear_bias);
+static struct kobj_attribute ema_shift_attr = __ATTR_RW(ema_shift);
+static struct kobj_attribute loglevel_attr = __ATTR_RW(loglevel);
+static struct kobj_attribute disk_count_attr = __ATTR_RO(disk_count);
+static struct kobj_attribute status_attr = __ATTR_RO(status);
+
+static struct attribute *tv_attrs[] = {
+	&policy_attr.attr,
+	&stale_ms_attr.attr,
+	&wear_bias_attr.attr,
+	&ema_shift_attr.attr,
+	&loglevel_attr.attr,
+	&disk_count_attr.attr,
+	&status_attr.attr,
+	NULL,
+};
+
+static struct attribute_group tv_attr_group = {
+	.attrs = tv_attrs,
+};
+
+static void tv_sysfs_init(void)
+{
+	tv_kobj = kobject_create_and_add("tieredvol", kernel_kobj);
+	if (!tv_kobj) {
+		pr_err("tieredvol: sysfs init failed\n");
+		return;
+	}
+	if (sysfs_create_group(tv_kobj, &tv_attr_group)) {
+		pr_err("tieredvol: sysfs group create failed\n");
+		kobject_put(tv_kobj);
+		tv_kobj = NULL;
+	}
+}
+
+static void tv_sysfs_exit(void)
+{
+	if (tv_kobj) {
+		sysfs_remove_group(tv_kobj, &tv_attr_group);
+		kobject_put(tv_kobj);
+		tv_kobj = NULL;
+	}
+}
+
 static void __exit tieredvol_exit(void)
 {
+	tv_sysfs_exit();
 	dm_unregister_target(&tieredvol_target);
 	destroy_workqueue(tv_wq);
 	kfifo_free(&tv_log_fifo);
