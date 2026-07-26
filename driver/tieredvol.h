@@ -7,6 +7,8 @@
 #include <linux/ktime.h>
 #include <linux/timer.h>
 #include <linux/bio.h>
+#include <linux/completion.h>
+#include <linux/workqueue.h>
 
 #define TV_MAX_DISKS    16
 #define TV_MAX_SEGS     16
@@ -53,6 +55,52 @@ enum tv_policy {
 	TV_POLICY_RANDOM = 2,
 };
 
+/* Phase 2: Sub-structs for tieredvol_ctx */
+
+struct tv_io_stats {
+	atomic_t in_flight_bytes[TV_MAX_DISKS];
+	u64 total_write_bytes[TV_MAX_DISKS];
+	u64 total_read_bytes[TV_MAX_DISKS];
+	u64 total_write_ops[TV_MAX_DISKS];
+	u64 total_read_ops[TV_MAX_DISKS];
+};
+
+struct tv_adaptive_state {
+	u32 ema_weight_shift;
+	u64 ema_load[TV_MAX_DISKS];
+	u64 stale_after_ns;
+	bool stale[TV_MAX_DISKS];
+	u64 stale_marked_ns[TV_MAX_DISKS];
+	u64 grace_until_ns[TV_MAX_DISKS];
+	u64 last_finish_ns[TV_MAX_DISKS];
+	u64 last_interval_bytes[TV_MAX_DISKS];
+	struct timer_list decay_timer;
+	u32 wear_bias;
+	enum tv_policy policy;
+};
+
+struct tv_mirror_stats {
+	u64 mirror_write_bytes;
+	u64 mirror_write_ops;
+	u64 mirror_errors;
+};
+
+struct tv_rebuild_state {
+	struct task_struct *thread;
+	int seg_idx;
+	u64 offset;
+	u64 total;
+	atomic_t running;
+	struct completion done_r;
+	struct completion done_w;
+};
+
+struct tv_degradation {
+	atomic_t *error_count;
+	u32 error_threshold;
+	bool degraded[TV_MAX_DISKS];
+};
+
 struct tieredvol_ctx {
 	struct dm_target *ti;
 	struct tieredvol_metadata meta;
@@ -62,40 +110,16 @@ struct tieredvol_ctx {
 	int ndisks;
 	sector_t min_chunk_sectors;
 	sector_t stripe_sectors;
-	atomic_t *error_count;
-	atomic_t in_flight_bytes[TV_MAX_DISKS];
-	u64 last_finish_ns[TV_MAX_DISKS];
 	bool adaptive_enabled;
-	u32 ema_weight_shift;
-	u64 ema_load[TV_MAX_DISKS];
-	u64 stale_after_ns;
-	bool stale[TV_MAX_DISKS];
-	u64 stale_marked_ns[TV_MAX_DISKS];
-	u64 grace_until_ns[TV_MAX_DISKS];
-	struct timer_list decay_timer;
-	u64 last_interval_bytes[TV_MAX_DISKS];
-	u64 total_write_bytes[TV_MAX_DISKS];
-	u64 total_read_bytes[TV_MAX_DISKS];
-	u64 total_write_ops[TV_MAX_DISKS];
-	u64 total_read_ops[TV_MAX_DISKS];
-	u32 wear_bias;
-	enum tv_policy policy;
-	u64 mirror_write_bytes;
-	u64 mirror_write_ops;
-	u64 mirror_errors;
-	bool degraded[TV_MAX_DISKS];
-	u32 error_threshold;
-	/* Mirror rebuild state (2c) */
-	struct task_struct *rebuild_thread;
-	int rebuild_seg_idx;
-	u64 rebuild_offset;
-	u64 rebuild_total;
-	atomic_t rebuild_running;
-	struct completion rebuild_done_r;
-	struct completion rebuild_done_w;
+	struct tv_io_stats io;
+	struct tv_degradation deg;
+	struct tv_adaptive_state adaptive;
+	struct tv_mirror_stats mirror;
+	struct tv_rebuild_state rebuild;
 	struct work_struct trigger_event;
 };
 
+/* ---- tieredvol_map.c exports ---- */
 struct tieredvol_map tv_map_logical(u64 logical,
 				    struct tieredvol_metadata *meta,
 				    u32 chunk_size);
@@ -110,8 +134,17 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 struct tieredvol_map tv_map_logical_random(u64 logical,
 					  struct tieredvol_metadata *meta,
 					  u32 chunk_size);
+
+/* ---- tieredvol_meta.c exports ---- */
 int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
 			    const char *path);
+
+/* ---- tieredvol_log.c exports ---- */
+void tv_log(u8 level, u8 disk_idx, u8 event_type, const char *fmt, ...);
+u64 tv_read_count(void);
+u64 tv_read_sectors(void);
+u64 tv_read_bytes(void);
+void tv_reset_stats(void);
 
 #define TV_LOG_SIZE 512
 
@@ -137,5 +170,43 @@ enum tv_log_event {
 	TV_LOG_MIRROR  = 3,
 	TV_LOG_CONFIG  = 4,
 };
+
+extern struct kfifo tv_log_fifo;
+extern spinlock_t tv_log_lock;
+extern u8 tv_log_level;
+extern unsigned int log_size;
+extern struct workqueue_struct *tv_wq;
+
+/* ---- tieredvol_mirror.c exports ---- */
+void tv_pw_add(struct block_device *bdev, sector_t sector, unsigned int size);
+void tv_pending_add(struct block_device *bdev, sector_t sector,
+		    unsigned int size, int mirror_disk);
+int tv_pending_find_and_remove(struct block_device *bdev, sector_t sector,
+			       unsigned int size);
+void tv_mirror_end_io(struct bio *bio);
+int tieredvol_end_io(struct dm_target *ti, struct bio *bio,
+		     blk_status_t *error);
+void tv_decay_timer_fn(struct timer_list *timer);
+
+struct tv_retry_ctx {
+	struct delayed_work dwork;
+	struct tieredvol_ctx *ctx;
+	sector_t sector;
+	unsigned int size;
+	int mirror_disk;
+};
+
+int tv_rebuild_thread(void *data);
+
+/* ---- tieredvol_sysfs.c exports ---- */
+void tv_sysfs_init(void);
+void tv_sysfs_exit(void);
+
+/* ---- tieredvol_message.c exports ---- */
+int tieredvol_message(struct dm_target *ti, unsigned int argc,
+		      char **argv, char *result, unsigned int maxlen);
+
+/* ---- Global active context ---- */
+extern struct tieredvol_ctx *tv_active_ctx;
 
 #endif

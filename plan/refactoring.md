@@ -20,7 +20,7 @@
 
 **驗證:** `make clean && make test` → 81/81
 **風險:** 零
-**狀態:** [ ] 待執行
+**狀態:** [x] 完成 (commit 91a25dd)
 
 ---
 
@@ -114,7 +114,7 @@ tieredvol-objs := tieredvol_core.o tieredvol_map.o tieredvol_meta.o \
 
 **驗證:** `make module` + `make test` → 81/81 + `test_comprehensive.sh` → 49/49
 **風險:** 中（純代碼搬移）
-**狀態:** [ ] 待執行
+**狀態:** [x] 完成 (Phase 1+2 combined)
 
 ---
 
@@ -225,7 +225,7 @@ struct tieredvol_ctx {
 **影響文件:** 所有 driver/ 下的 .c 文件
 **驗證:** `make module` + `make test` + `test_comprehensive.sh`
 **風險:** 中（機械式全局替換）
-**狀態:** [ ] 待執行
+**狀態:** [x] 完成 (Phase 1+2 combined, 81/81 unit tests pass)
 
 ---
 
