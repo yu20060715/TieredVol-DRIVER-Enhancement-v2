@@ -81,15 +81,18 @@ struct tieredvol_ctx {
 };
 
 struct tieredvol_map tv_map_logical(u64 logical,
-				    struct tieredvol_metadata *meta);
+				    struct tieredvol_metadata *meta,
+				    u32 chunk_size);
 struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 					    struct tieredvol_metadata *meta,
 					    u64 *ema_load, bool *stale,
 					    int ndisks,
 					    u64 *total_write_bytes,
-					    u32 wear_bias);
+					    u32 wear_bias,
+					    u32 chunk_size);
 struct tieredvol_map tv_map_logical_random(u64 logical,
-					  struct tieredvol_metadata *meta);
+					  struct tieredvol_metadata *meta,
+					  u32 chunk_size);
 int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
 			    const char *path);
 

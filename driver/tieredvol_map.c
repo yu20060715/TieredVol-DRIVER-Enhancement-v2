@@ -24,7 +24,8 @@ static int tv_find_segment(u64 logical, const struct tieredvol_metadata *meta)
 }
 
 struct tieredvol_map tv_map_logical(u64 logical,
-				    struct tieredvol_metadata *meta)
+				    struct tieredvol_metadata *meta,
+				    u32 chunk_size)
 {
 	struct tieredvol_map err = { .disk = -1, .offset = 0, .length = 0 };
 	int seg_idx, disk_idx;
@@ -51,7 +52,7 @@ struct tieredvol_map tv_map_logical(u64 logical,
 	boundary[0] = 0;
 	for (i = 0; i < (int)seg->disk_count; i++)
 		boundary[i + 1] = boundary[i] +
-			(u64)seg->weight[i] * TV_CHUNK_SIZE;
+			(u64)seg->weight[i] * chunk_size;
 
 	disk_idx = -1;
 	for (i = 0; i < (int)seg->disk_count; i++) {
@@ -70,9 +71,9 @@ struct tieredvol_map tv_map_logical(u64 logical,
 		map.disk = (int)seg->disk_index[disk_idx];
 		map.seg_idx = seg_idx;
 		map.offset = stripe_no * (u64)seg->weight[disk_idx] *
-			     TV_CHUNK_SIZE +
+			     chunk_size +
 			     (offset_in - boundary[disk_idx]);
-		map.length = (u64)seg->weight[disk_idx] * TV_CHUNK_SIZE;
+		map.length = (u64)seg->weight[disk_idx] * chunk_size;
 
 		return map;
 	}
@@ -83,7 +84,8 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 					    u64 *ema_load, bool *stale,
 					    int ndisks,
 					    u64 *total_write_bytes,
-					    u32 wear_bias)
+					    u32 wear_bias,
+					    u32 chunk_size)
 {
 	struct tieredvol_map err = { .disk = -1, .offset = 0, .length = 0 };
 	int seg_idx;
@@ -149,7 +151,7 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 
 	{
 		struct tieredvol_map map;
-		u64 disk_chunk = (u64)seg->weight[best_disk] * TV_CHUNK_SIZE;
+		u64 disk_chunk = (u64)seg->weight[best_disk] * chunk_size;
 
 		map.disk = (int)seg->disk_index[best_disk];
 		map.seg_idx = seg_idx;
@@ -162,7 +164,8 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 }
 
 struct tieredvol_map tv_map_logical_random(u64 logical,
-					  struct tieredvol_metadata *meta)
+					  struct tieredvol_metadata *meta,
+					  u32 chunk_size)
 {
 	struct tieredvol_map err = { .disk = -1, .offset = 0, .length = 0 };
 	int seg_idx;
@@ -189,7 +192,7 @@ struct tieredvol_map tv_map_logical_random(u64 logical,
 
 	{
 		struct tieredvol_map map;
-		u64 disk_chunk = (u64)seg->weight[disk_idx] * TV_CHUNK_SIZE;
+		u64 disk_chunk = (u64)seg->weight[disk_idx] * chunk_size;
 
 		map.disk = (int)seg->disk_index[disk_idx];
 		map.seg_idx = seg_idx;

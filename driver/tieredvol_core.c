@@ -168,14 +168,17 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 					      ctx->ema_load, ctx->stale,
 					      ctx->ndisks,
 					      ctx->total_write_bytes,
-					      ctx->wear_bias);
+					      ctx->wear_bias,
+					      ctx->meta.chunk_size);
 		break;
 	case TV_POLICY_RANDOM:
-		cur = tv_map_logical_random(logical, &ctx->meta);
+		cur = tv_map_logical_random(logical, &ctx->meta,
+					    ctx->meta.chunk_size);
 		break;
 	case TV_POLICY_STATIC:
 	default:
-		cur = tv_map_logical(logical, &ctx->meta);
+		cur = tv_map_logical(logical, &ctx->meta,
+				     ctx->meta.chunk_size);
 		break;
 	}
 
@@ -339,7 +342,7 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 	}
 
 	/* Compute min_chunk_sectors and stripe_sectors across all segments.
-	 * min_chunk = min over all segments of (min weight * TV_CHUNK_SIZE).
+	 * min_chunk = min over all segments of (min weight * chunk_size).
 	 * dm_set_target_max_io_len() ensures dm core splits bios so they
 	 * never cross a disk boundary within a stripe.
 	 */
@@ -347,6 +350,7 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 		sector_t global_min_chunk = (sector_t)-1;
 		sector_t max_stripe = 0;
 		u32 si, j;
+		sector_t chunk_sectors = ctx->meta.chunk_size >> SECTOR_SHIFT;
 
 		for (si = 0; si < ctx->meta.segment_count; si++) {
 			struct tieredvol_segment *seg = &ctx->meta.segments[si];
@@ -355,10 +359,10 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 			if (seg->disk_count == 0)
 				continue;
 
-			seg_min = (sector_t)seg->weight[0] * (TV_CHUNK_SIZE >> SECTOR_SHIFT);
+			seg_min = (sector_t)seg->weight[0] * chunk_sectors;
 			for (j = 1; j < seg->disk_count; j++) {
 				sector_t w = (sector_t)seg->weight[j] *
-					     (TV_CHUNK_SIZE >> SECTOR_SHIFT);
+					     chunk_sectors;
 
 				if (w < seg_min)
 					seg_min = w;
