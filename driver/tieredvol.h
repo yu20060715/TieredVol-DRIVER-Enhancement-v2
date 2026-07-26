@@ -33,6 +33,11 @@ struct tieredvol_metadata {
 	u32 disk_count;
 	char disk_names[TV_MAX_DISKS][64];
 	struct tieredvol_segment segments[TV_MAX_SEGS];
+	/* Runtime defaults persisted in [runtime] section */
+	int runtime_policy;
+	u32 runtime_stale_ms;
+	u32 runtime_ema_shift;
+	u32 runtime_wear_bias;
 };
 
 struct tieredvol_map {
@@ -53,6 +58,7 @@ struct tieredvol_ctx {
 	struct tieredvol_metadata meta;
 	struct dm_dev **devs;
 	sector_t *disk_sectors;
+	char config_path[256];
 	int ndisks;
 	sector_t min_chunk_sectors;
 	sector_t stripe_sectors;

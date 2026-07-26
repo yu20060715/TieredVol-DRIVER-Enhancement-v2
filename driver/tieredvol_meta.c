@@ -279,6 +279,17 @@ int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
 			seg->mirror_enabled = true;
 			seg->mirror_disk = mirror_idx;
 		}
+		} else if (strcmp(k, "policy") == 0) {
+			long v2;
+
+			if (kstrtol(v, 10, &v2) == 0)
+				meta->runtime_policy = (int)v2;
+		} else if (strcmp(k, "stale_ms") == 0) {
+			parse_u32(v, &meta->runtime_stale_ms);
+		} else if (strcmp(k, "ema_shift") == 0) {
+			parse_u32(v, &meta->runtime_ema_shift);
+		} else if (strcmp(k, "wear_bias") == 0) {
+			parse_u32(v, &meta->runtime_wear_bias);
 		}
 	}
 

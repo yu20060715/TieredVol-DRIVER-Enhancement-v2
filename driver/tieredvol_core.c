@@ -9,6 +9,9 @@
 #include <linux/jiffies.h>
 #include <linux/kfifo.h>
 #include <linux/sysfs.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+#include <linux/crc32c.h>
 #include "tieredvol.h"
 
 #define DM_MSG_PREFIX "tieredvol"
@@ -437,6 +440,7 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 	}
 
 	ctx->ti = ti;
+	strscpy(ctx->config_path, argv[0], sizeof(ctx->config_path));
 
 	ret = tv_metadata_load_kernel(&ctx->meta, argv[0]);
 	if (ret) {
@@ -482,10 +486,14 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 	INIT_WORK(&ctx->trigger_event, trigger_event);
 
 	ctx->adaptive_enabled = false;
-	ctx->ema_weight_shift = 3;
-	ctx->stale_after_ns = 5000000000ULL;
-	ctx->wear_bias = 0;
-	ctx->policy = TV_POLICY_STATIC;
+	/* Use runtime defaults from config if present, else hard defaults */
+	ctx->policy = ctx->meta.runtime_policy;
+	ctx->ema_weight_shift = ctx->meta.runtime_ema_shift ?
+				ctx->meta.runtime_ema_shift : 3;
+	ctx->stale_after_ns = ctx->meta.runtime_stale_ms ?
+			      (u64)ctx->meta.runtime_stale_ms * 1000000ULL :
+			      5000000000ULL;
+	ctx->wear_bias = ctx->meta.runtime_wear_bias;
 	ctx->mirror_write_bytes = 0;
 	ctx->mirror_write_ops = 0;
 	ctx->mirror_errors = 0;
@@ -707,6 +715,120 @@ static void tieredvol_status(struct dm_target *ti, status_type_t type,
 	}
 }
 
+/*
+ * Metadata write-back (1d): persist runtime config changes to disk.
+ * Uses kernel file I/O (filp_open/kernel_write) — acceptable for a
+ * research module. Writes a backup (.bak) then the new file with CRC32.
+ */
+static int tv_metadata_save_kernel(struct tieredvol_ctx *ctx)
+{
+	struct file *f;
+	char buf[4096];
+	int off = 0;
+	int ret;
+	u32 crc;
+	loff_t pos = 0;
+	char bak_path[260];
+
+	if (!ctx->config_path[0])
+		return -ENOENT;
+
+	off += scnprintf(buf + off, sizeof(buf) - off, "[weighted_striping]\n");
+	off += scnprintf(buf + off, sizeof(buf) - off, "version=%u\n", ctx->meta.version);
+	off += scnprintf(buf + off, sizeof(buf) - off, "chunk_size=%u\n", ctx->meta.chunk_size);
+	off += scnprintf(buf + off, sizeof(buf) - off, "segment_count=%u\n", ctx->meta.segment_count);
+	off += scnprintf(buf + off, sizeof(buf) - off, "disk_count=%u\n", ctx->meta.disk_count);
+
+	for (u32 i = 0; i < ctx->meta.disk_count; i++)
+		off += scnprintf(buf + off, sizeof(buf) - off, "disk%u_name=%s\n",
+				 i, ctx->meta.disk_names[i]);
+
+	for (u32 i = 0; i < ctx->meta.segment_count; i++) {
+		struct tieredvol_segment *seg = &ctx->meta.segments[i];
+
+		off += scnprintf(buf + off, sizeof(buf) - off, "seg%u_begin=%llu\n",
+				 i, seg->logical_begin);
+		off += scnprintf(buf + off, sizeof(buf) - off, "seg%u_end=%llu\n",
+				 i, seg->logical_end);
+		off += scnprintf(buf + off, sizeof(buf) - off, "seg%u_count=%u\n",
+				 i, seg->disk_count);
+
+		off += scnprintf(buf + off, sizeof(buf) - off, "seg%u_disks=", i);
+		for (u32 j = 0; j < seg->disk_count; j++)
+			off += scnprintf(buf + off, sizeof(buf) - off, "%s%u",
+					 j ? "," : "", seg->disk_index[j]);
+		off += scnprintf(buf + off, sizeof(buf) - off, "\n");
+
+		off += scnprintf(buf + off, sizeof(buf) - off, "seg%u_weight=", i);
+		for (u32 j = 0; j < seg->disk_count; j++)
+			off += scnprintf(buf + off, sizeof(buf) - off, "%s%u",
+					 j ? "," : "", seg->weight[j]);
+		off += scnprintf(buf + off, sizeof(buf) - off, "\n");
+
+		off += scnprintf(buf + off, sizeof(buf) - off, "seg%u_stripe=%llu\n",
+				 i, seg->stripe_size);
+		if (seg->mirror_enabled)
+			off += scnprintf(buf + off, sizeof(buf) - off,
+					 "seg%u_mirror=%u\n", i, seg->mirror_disk);
+	}
+
+	/* Runtime section */
+	off += scnprintf(buf + off, sizeof(buf) - off, "[runtime]\n");
+	off += scnprintf(buf + off, sizeof(buf) - off, "policy=%d\n", ctx->policy);
+	off += scnprintf(buf + off, sizeof(buf) - off, "stale_ms=%llu\n",
+			 ctx->stale_after_ns / 1000000ULL);
+	off += scnprintf(buf + off, sizeof(buf) - off, "ema_shift=%u\n",
+			 ctx->ema_weight_shift);
+	off += scnprintf(buf + off, sizeof(buf) - off, "wear_bias=%u\n",
+			 ctx->wear_bias);
+
+	crc = crc32c(0, buf, off);
+	off += scnprintf(buf + off, sizeof(buf) - off, "crc32=%u\n", crc);
+
+	/* Write backup */
+	scnprintf(bak_path, sizeof(bak_path), "%s.bak", ctx->config_path);
+
+	/* Create backup of current file */
+	f = filp_open(ctx->config_path, O_RDONLY, 0);
+	if (!IS_ERR(f)) {
+		struct file *bak;
+
+		bak = filp_open(bak_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (!IS_ERR(bak)) {
+			char kbuf[4096];
+			loff_t rpos = 0, wpos = 0;
+			ssize_t nrd;
+
+			while ((nrd = kernel_read(f, kbuf, sizeof(kbuf), &rpos)) > 0)
+				kernel_write(bak, kbuf, nrd, &wpos);
+			filp_close(bak, NULL);
+		}
+		filp_close(f, NULL);
+	}
+
+	/* Write new file */
+	f = filp_open(ctx->config_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (IS_ERR(f)) {
+		pr_err("tieredvol: save failed to open %s: %ld\n",
+		       ctx->config_path, PTR_ERR(f));
+		return PTR_ERR(f);
+	}
+
+	pos = 0;
+	ret = kernel_write(f, buf, off, &pos);
+	filp_close(f, NULL);
+
+	if (ret != off) {
+		pr_err("tieredvol: save write error %d (wrote %lld of %d)\n",
+		       ret, pos, off);
+		return ret < 0 ? ret : -EIO;
+	}
+
+	tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "metadata saved crc=0x%08x", crc);
+	pr_info("tieredvol: metadata saved crc=0x%08x to %s\n", crc, ctx->config_path);
+	return 0;
+}
+
 static int tieredvol_message(struct dm_target *ti, unsigned int argc,
 			     char **argv, char *result, unsigned int maxlen)
 {
@@ -775,6 +897,7 @@ found:
 		ctx->policy = TV_POLICY_ADAPTIVE;
 		pr_info("tieredvol: policy = adaptive\n");
 		tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "policy=adaptive");
+		tv_metadata_save_kernel(ctx);
 		return 0;
 	}
 	if (argc == 1 && strcmp(argv[0], "adaptive_off") == 0) {
@@ -783,6 +906,7 @@ found:
 		ctx->policy = TV_POLICY_STATIC;
 		pr_info("tieredvol: policy = static\n");
 		tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "policy=static");
+		tv_metadata_save_kernel(ctx);
 		return 0;
 	}
 	if (argc == 2 && strcmp(argv[0], "set_policy") == 0) {
@@ -798,6 +922,7 @@ found:
 			return -EINVAL;
 		pr_info("tieredvol: policy = %s\n", argv[1]);
 		tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "policy=%s", argv[1]);
+		tv_metadata_save_kernel(ctx);
 		return 0;
 	}
 	if (argc == 2 && strcmp(argv[0], "set_ema_shift") == 0) {
@@ -810,6 +935,7 @@ found:
 		pr_info("tieredvol: ema_weight_shift=%u (alpha=%u/1024)\n",
 			shift, 1 << shift);
 		tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "ema_shift=%u", shift);
+		tv_metadata_save_kernel(ctx);
 		return 0;
 	}
 	if (argc == 2 && strcmp(argv[0], "set_stale_ms") == 0) {
@@ -821,6 +947,7 @@ found:
 		ctx->stale_after_ns = (u64)ms * 1000000ULL;
 		pr_info("tieredvol: stale_after=%ums\n", ms);
 		tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "stale_ms=%u", ms);
+		tv_metadata_save_kernel(ctx);
 		return 0;
 	}
 	if (argc == 1 && strcmp(argv[0], "show_adaptive") == 0) {
@@ -898,6 +1025,7 @@ found:
 		ctx->wear_bias = bias;
 		pr_info("tieredvol: wear_bias=%u\n", bias);
 		tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "wear_bias=%u", bias);
+		tv_metadata_save_kernel(ctx);
 		return 0;
 	}
 	if (argc == 1 && strcmp(argv[0], "reset_wear") == 0) {
@@ -949,6 +1077,7 @@ found:
 			seg_idx, disk_idx, ctx->meta.disk_names[disk_idx]);
 		tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG,
 		       "mirror seg%u->disk%u", seg_idx, disk_idx);
+		tv_metadata_save_kernel(ctx);
 		return 0;
 	}
 	if (argc == 1 && strcmp(argv[0], "show_log") == 0) {
