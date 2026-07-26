@@ -26,7 +26,12 @@ static DEFINE_PER_CPU(u64, tv_map_count);
 static DEFINE_PER_CPU(u64, tv_map_sectors);
 static DEFINE_PER_CPU(u64, tv_map_bytes);
 
-static DEFINE_KFIFO(tv_log_fifo, struct tv_log_entry, TV_LOG_SIZE);
+/* Configurable log buffer — default 512 entries, set via module_param */
+static unsigned int log_size = TV_LOG_SIZE;
+module_param(log_size, uint, 0644);
+MODULE_PARM_DESC(log_size, "Ring buffer log entries (default 512, power of 2)");
+
+static struct kfifo tv_log_fifo;
 static DEFINE_SPINLOCK(tv_log_lock);
 static u8 tv_log_level = TV_LOG_INFO;
 
@@ -49,7 +54,7 @@ static void tv_log(u8 level, u8 disk_idx, u8 event_type, const char *fmt, ...)
 	va_end(args);
 
 	spin_lock_irqsave(&tv_log_lock, flags);
-	kfifo_put(&tv_log_fifo, entry);
+	kfifo_in(&tv_log_fifo, &entry, sizeof(entry));
 	spin_unlock_irqrestore(&tv_log_lock, flags);
 }
 
@@ -781,7 +786,7 @@ found:
 		int cnt = 0;
 
 		spin_lock_irqsave(&tv_log_lock, flags);
-		while (kfifo_get(&tv_log_fifo, &entry)) {
+		while (kfifo_out(&tv_log_fifo, &entry, sizeof(entry))) {
 			pr_info("tieredvol: LOG %s %s: %s\n",
 				entry.level == TV_LOG_ERR ? "ERR" :
 				entry.level == TV_LOG_WARN ? "WRN" : "INF",
@@ -842,20 +847,36 @@ static int __init tieredvol_init(void)
 {
 	int ret;
 
+	/* Allocate log ring buffer (round up to power of 2) */
+	if (log_size == 0)
+		log_size = TV_LOG_SIZE;
+	if (!is_power_of_2(log_size))
+		log_size = roundup_pow_of_two(log_size);
+
+	ret = kfifo_alloc(&tv_log_fifo,
+			  log_size * sizeof(struct tv_log_entry),
+			  GFP_KERNEL);
+	if (ret) {
+		pr_err("tieredvol: kfifo alloc failed (%u entries)\n", log_size);
+		return ret;
+	}
+
 	ret = dm_register_target(&tieredvol_target);
 	if (ret < 0) {
 		pr_err("tieredvol: registration failed: %d\n", ret);
+		kfifo_free(&tv_log_fifo);
 		return ret;
 	}
 
 	tv_wq = alloc_workqueue("tieredvol_wq", WQ_UNBOUND | WQ_HIGHPRI, 0);
 	if (!tv_wq) {
 		dm_unregister_target(&tieredvol_target);
+		kfifo_free(&tv_log_fifo);
 		pr_err("tieredvol: workqueue alloc failed\n");
 		return -ENOMEM;
 	}
 
-	pr_info("tieredvol: module loaded\n");
+	pr_info("tieredvol: module loaded (log_size=%u)\n", log_size);
 	return 0;
 }
 
@@ -863,6 +884,7 @@ static void __exit tieredvol_exit(void)
 {
 	dm_unregister_target(&tieredvol_target);
 	destroy_workqueue(tv_wq);
+	kfifo_free(&tv_log_fifo);
 	pr_info("tieredvol: module unloaded\n");
 }
 
