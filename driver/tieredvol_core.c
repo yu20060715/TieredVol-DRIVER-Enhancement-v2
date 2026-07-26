@@ -12,6 +12,8 @@
 #include <linux/fs.h>
 #include <linux/uaccess.h>
 #include <linux/crc32c.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
 #include "tieredvol.h"
 
 #define DM_MSG_PREFIX "tieredvol"
@@ -620,6 +622,11 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 	ctx->mirror_write_ops = 0;
 	ctx->mirror_errors = 0;
 	ctx->error_threshold = 10;
+	ctx->rebuild_thread = NULL;
+	ctx->rebuild_seg_idx = -1;
+	ctx->rebuild_offset = 0;
+	ctx->rebuild_total = 0;
+	atomic_set(&ctx->rebuild_running, 0);
 
 	timer_setup(&ctx->decay_timer, tv_decay_timer_fn, 0);
 	mod_timer(&ctx->decay_timer, jiffies + TV_DECAY_INTERVAL);
@@ -733,6 +740,14 @@ static void tieredvol_dtr(struct dm_target *ti)
 
 	timer_delete_sync(&ctx->decay_timer);
 	flush_work(&ctx->trigger_event);
+
+	/* Stop rebuild thread if running */
+	if (atomic_read(&ctx->rebuild_running)) {
+		atomic_set(&ctx->rebuild_running, 0);
+		if (!IS_ERR_OR_NULL(ctx->rebuild_thread))
+			kthread_stop(ctx->rebuild_thread);
+	}
+
 	kfree(ctx->error_count);
 
 	for (i = 0; i < ctx->ndisks; i++)
@@ -811,15 +826,20 @@ static void tieredvol_status(struct dm_target *ti, status_type_t type,
 			else
 				status = 'A';
 
-			off += snprintf(result + off, maxlen - off,
-					" %c%s:rd=%llu/%llu wr=%llu/%llu",
-					status,
-					ctx->meta.disk_names[i],
-					ctx->total_read_ops[i],
-					ctx->total_read_bytes[i],
-					ctx->total_write_ops[i],
-					ctx->total_write_bytes[i]);
+		off += snprintf(result + off, maxlen - off,
+				" %c%s:rd=%llu/%llu wr=%llu/%llu",
+				status,
+				ctx->meta.disk_names[i],
+				ctx->total_read_ops[i],
+				ctx->total_read_bytes[i],
+				ctx->total_write_ops[i],
+				ctx->total_write_bytes[i]);
 		}
+		if (atomic_read(&ctx->rebuild_running))
+			off += snprintf(result + off, maxlen - off,
+					" rebuild=%d/%d",
+					ctx->rebuild_seg_idx,
+					(int)(ctx->rebuild_offset / ctx->meta.chunk_size));
 		break;
 	}
 	case STATUSTYPE_TABLE: {
@@ -953,6 +973,151 @@ static int tv_metadata_save_kernel(struct tieredvol_ctx *ctx)
 
 	tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "metadata saved crc=0x%08x", crc);
 	pr_info("tieredvol: metadata saved crc=0x%08x to %s\n", crc, ctx->config_path);
+	return 0;
+}
+
+/*
+ * Mirror rebuild thread (2c): reads from primary disk, writes to mirror.
+ * Runs as a kernel thread, processing one chunk at a time.
+ * Progress is tracked via ctx->rebuild_offset and visible in dmsetup status.
+ */
+static void tv_rebuild_end_io(struct bio *bio)
+{
+	struct completion *done = bio->bi_private;
+
+	complete(done);
+}
+
+static int tv_rebuild_thread(void *data)
+{
+	struct tieredvol_ctx *ctx = data;
+	struct tieredvol_segment *seg;
+	struct bio *bio_r, *bio_w;
+	int disk_idx;
+	unsigned int chunk_bytes;
+	DECLARE_COMPLETION_ONSTACK(done_r);
+	DECLARE_COMPLETION_ONSTACK(done_w);
+
+	while (!kthread_should_stop()) {
+		if (atomic_read(&ctx->rebuild_running) == 0)
+			break;
+
+		seg = &ctx->meta.segments[ctx->rebuild_seg_idx];
+		disk_idx = (int)seg->disk_index[0];
+		chunk_bytes = ctx->meta.chunk_size;
+
+		/* Check if rebuild is complete */
+		if (ctx->rebuild_offset >= ctx->rebuild_total) {
+			pr_info("tieredvol: rebuild seg%d complete (%llu bytes)\n",
+				ctx->rebuild_seg_idx, ctx->rebuild_total);
+			tv_log(TV_LOG_INFO, seg->mirror_disk, TV_LOG_MIRROR,
+			       "rebuild seg%d complete %llu bytes",
+			       ctx->rebuild_seg_idx, ctx->rebuild_total);
+			atomic_set(&ctx->rebuild_running, 0);
+			schedule_work(&ctx->trigger_event);
+			break;
+		}
+
+		/* Read from primary disk */
+		{
+			struct page *pg;
+
+			pg = alloc_page(GFP_NOIO);
+			if (!pg) {
+				msleep(10);
+				continue;
+			}
+
+			reinit_completion(&done_r);
+
+			bio_r = bio_alloc(ctx->devs[disk_idx]->bdev,
+					  1, REQ_OP_READ, GFP_NOIO);
+			if (!bio_r) {
+				put_page(pg);
+				msleep(10);
+				continue;
+			}
+			bio_r->bi_iter.bi_sector = (ctx->rebuild_offset +
+						     seg->logical_begin) >> SECTOR_SHIFT;
+			bio_r->bi_iter.bi_size = chunk_bytes;
+			bio_r->bi_private = &done_r;
+			bio_r->bi_end_io = tv_rebuild_end_io;
+
+			if (bio_add_page(bio_r, pg, chunk_bytes, 0) != chunk_bytes) {
+				put_page(pg);
+				bio_put(bio_r);
+				msleep(10);
+				continue;
+			}
+
+			submit_bio(bio_r);
+			wait_for_completion(&done_r);
+
+			if (bio_r->bi_status != BLK_STS_OK) {
+				pr_err("tieredvol: rebuild read failed at offset %llu\n",
+				       ctx->rebuild_offset);
+				put_page(pg);
+				bio_put(bio_r);
+				msleep(100);
+				continue;
+			}
+			bio_put(bio_r);
+
+			/* Write to mirror disk */
+			reinit_completion(&done_w);
+
+			bio_w = bio_alloc(ctx->devs[seg->mirror_disk]->bdev,
+					  1, REQ_OP_WRITE, GFP_NOIO);
+			if (!bio_w) {
+				put_page(pg);
+				msleep(10);
+				continue;
+			}
+			bio_w->bi_iter.bi_sector = (ctx->rebuild_offset +
+						     seg->logical_begin) >> SECTOR_SHIFT;
+			bio_w->bi_iter.bi_size = chunk_bytes;
+			bio_w->bi_private = &done_w;
+			bio_w->bi_end_io = tv_rebuild_end_io;
+
+			if (bio_add_page(bio_w, pg, chunk_bytes, 0) != chunk_bytes) {
+				put_page(pg);
+				bio_put(bio_w);
+				msleep(10);
+				continue;
+			}
+
+			submit_bio(bio_w);
+			wait_for_completion(&done_w);
+
+			if (bio_w->bi_status != BLK_STS_OK) {
+				pr_err("tieredvol: rebuild write failed at offset %llu\n",
+				       ctx->rebuild_offset);
+				put_page(pg);
+				bio_put(bio_w);
+				msleep(100);
+				continue;
+			}
+			put_page(pg);
+			bio_put(bio_w);
+		}
+
+		ctx->rebuild_offset += chunk_bytes;
+
+		/* Log progress every 10MB */
+		if ((ctx->rebuild_offset % (10 * 1024 * 1024)) == 0 ||
+		    ctx->rebuild_offset >= ctx->rebuild_total) {
+			u64 pct = ctx->rebuild_total ?
+				  (ctx->rebuild_offset * 100 / ctx->rebuild_total) : 0;
+
+			pr_info("tieredvol: rebuild seg%d %llu/%llu (%llu%%)\n",
+				ctx->rebuild_seg_idx,
+				ctx->rebuild_offset, ctx->rebuild_total, pct);
+		}
+
+		cond_resched();
+	}
+
+	atomic_set(&ctx->rebuild_running, 0);
 	return 0;
 }
 
@@ -1313,6 +1478,70 @@ found:
 			}
 		}
 		snprintf(result, maxlen, "%d disk(s) cleared", cleared);
+		return 0;
+	}
+	if (argc == 2 && strcmp(argv[0], "start_rebuild") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+		u32 seg_idx;
+
+		if (kstrtou32(argv[1], 10, &seg_idx) ||
+		    seg_idx >= ctx->meta.segment_count)
+			return -EINVAL;
+		if (atomic_read(&ctx->rebuild_running))
+			return -EBUSY;
+		if (!ctx->meta.segments[seg_idx].mirror_enabled)
+			return -EINVAL;
+
+		ctx->rebuild_seg_idx = seg_idx;
+		ctx->rebuild_offset = 0;
+		ctx->rebuild_total = ctx->meta.segments[seg_idx].logical_end -
+				     ctx->meta.segments[seg_idx].logical_begin;
+		atomic_set(&ctx->rebuild_running, 1);
+
+		ctx->rebuild_thread = kthread_run(tv_rebuild_thread, ctx,
+						  "tv_rebuild_%d", seg_idx);
+		if (IS_ERR(ctx->rebuild_thread)) {
+			atomic_set(&ctx->rebuild_running, 0);
+			return PTR_ERR(ctx->rebuild_thread);
+		}
+		pr_info("tieredvol: rebuild started for seg%u (%llu bytes)\n",
+			seg_idx, ctx->rebuild_total);
+		tv_log(TV_LOG_INFO, ctx->meta.segments[seg_idx].mirror_disk,
+		       TV_LOG_MIRROR, "rebuild start seg%u %llu bytes",
+		       seg_idx, ctx->rebuild_total);
+		return 0;
+	}
+	if (argc == 1 && strcmp(argv[0], "stop_rebuild") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+
+		if (!atomic_read(&ctx->rebuild_running))
+			return 0;
+		atomic_set(&ctx->rebuild_running, 0);
+		if (!IS_ERR_OR_NULL(ctx->rebuild_thread)) {
+			kthread_stop(ctx->rebuild_thread);
+			ctx->rebuild_thread = NULL;
+		}
+		pr_info("tieredvol: rebuild stopped at %llu/%llu\n",
+			ctx->rebuild_offset, ctx->rebuild_total);
+		tv_log(TV_LOG_WARN, 0, TV_LOG_MIRROR,
+		       "rebuild stopped %llu/%llu",
+		       ctx->rebuild_offset, ctx->rebuild_total);
+		return 0;
+	}
+	if (argc == 1 && strcmp(argv[0], "show_rebuild") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+
+		if (atomic_read(&ctx->rebuild_running)) {
+			u64 pct = ctx->rebuild_total ?
+				  (ctx->rebuild_offset * 100 / ctx->rebuild_total) : 0;
+
+			snprintf(result, maxlen, "rebuilding seg%d %llu/%llu (%llu%%)",
+				 ctx->rebuild_seg_idx,
+				 ctx->rebuild_offset,
+				 ctx->rebuild_total, pct);
+		} else {
+			snprintf(result, maxlen, "idle");
+		}
 		return 0;
 	}
 	return -EINVAL;

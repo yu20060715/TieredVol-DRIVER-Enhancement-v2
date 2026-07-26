@@ -85,6 +85,12 @@ struct tieredvol_ctx {
 	u64 mirror_errors;
 	bool degraded[TV_MAX_DISKS];
 	u32 error_threshold;
+	/* Mirror rebuild state (2c) */
+	struct task_struct *rebuild_thread;
+	int rebuild_seg_idx;
+	u64 rebuild_offset;
+	u64 rebuild_total;
+	atomic_t rebuild_running;
 	struct work_struct trigger_event;
 };
 
