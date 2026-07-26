@@ -7,6 +7,7 @@
 #include <linux/percpu.h>
 #include <linux/timer.h>
 #include <linux/jiffies.h>
+#include <linux/kfifo.h>
 #include "tieredvol.h"
 
 #define DM_MSG_PREFIX "tieredvol"
@@ -24,6 +25,33 @@ static struct workqueue_struct *tv_wq;
 static DEFINE_PER_CPU(u64, tv_map_count);
 static DEFINE_PER_CPU(u64, tv_map_sectors);
 static DEFINE_PER_CPU(u64, tv_map_bytes);
+
+static DEFINE_KFIFO(tv_log_fifo, struct tv_log_entry, TV_LOG_SIZE);
+static DEFINE_SPINLOCK(tv_log_lock);
+static u8 tv_log_level = TV_LOG_INFO;
+
+static void tv_log(u8 level, u8 disk_idx, u8 event_type, const char *fmt, ...)
+{
+	struct tv_log_entry entry;
+	va_list args;
+	unsigned long flags;
+
+	if (level > tv_log_level)
+		return;
+
+	entry.timestamp_ns = ktime_get_ns();
+	entry.level = level;
+	entry.disk_idx = disk_idx;
+	entry.event_type = event_type;
+
+	va_start(args, fmt);
+	vsnprintf(entry.msg, sizeof(entry.msg), fmt, args);
+	va_end(args);
+
+	spin_lock_irqsave(&tv_log_lock, flags);
+	kfifo_put(&tv_log_fifo, entry);
+	spin_unlock_irqrestore(&tv_log_lock, flags);
+}
 
 static void trigger_event(struct work_struct *work)
 {
@@ -91,11 +119,14 @@ static void tv_decay_timer_fn(struct timer_list *timer)
 			pr_info("tieredvol: disk[%d] %s STALE (no I/O for %llu ms)\n",
 				i, ctx->meta.disk_names[i],
 				(now - ctx->last_finish_ns[i]) / 1000000ULL);
+			tv_log(TV_LOG_WARN, i, TV_LOG_STALE,
+			       "STALE %llums", (now - ctx->last_finish_ns[i]) / 1000000ULL);
 		} else if (ctx->stale[i] && snapshot > 0) {
 			ctx->stale[i] = false;
 			ctx->grace_until_ns[i] = now + ctx->stale_after_ns;
 			pr_info("tieredvol: disk[%d] %s RECOVERED (I/O resumed)\n",
 				i, ctx->meta.disk_names[i]);
+			tv_log(TV_LOG_INFO, i, TV_LOG_RECOVER, "RECOVERED io");
 		} else if (ctx->stale[i] &&
 			   (now - ctx->stale_marked_ns[i]) >
 			   2 * ctx->stale_after_ns) {
@@ -103,6 +134,7 @@ static void tv_decay_timer_fn(struct timer_list *timer)
 			ctx->grace_until_ns[i] = now + ctx->stale_after_ns;
 			pr_info("tieredvol: disk[%d] %s RECOVERED (cooldown)\n",
 				i, ctx->meta.disk_names[i]);
+			tv_log(TV_LOG_INFO, i, TV_LOG_RECOVER, "RECOVERED cooldown");
 		}
 	}
 
@@ -150,6 +182,8 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 	if (cur.disk < 0 || cur.disk >= ctx->ndisks) {
 		pr_err("tieredvol: map failed for sector %llu\n",
 		       (unsigned long long)bio->bi_iter.bi_sector);
+		tv_log(TV_LOG_ERR, 0, TV_LOG_IO,
+		       "map fail sec=%llu", bio->bi_iter.bi_sector);
 		bio_io_error(bio);
 		return DM_MAPIO_SUBMITTED;
 	}
@@ -188,8 +222,14 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 				clone->bi_end_io = tv_mirror_end_io;
 				ctx->mirror_write_bytes += bio->bi_iter.bi_size;
 				submit_bio(clone);
+				tv_log(TV_LOG_INFO, cur.disk, TV_LOG_MIRROR,
+				       "mirrored %uKB seg%d->disk%d",
+				       bio->bi_iter.bi_size >> 10,
+				       cur.seg_idx, seg->mirror_disk);
 			} else {
 				ctx->mirror_errors++;
+				tv_log(TV_LOG_ERR, cur.disk, TV_LOG_MIRROR,
+				       "mirror alloc fail seg%d", cur.seg_idx);
 			}
 		}
 	}
@@ -544,6 +584,7 @@ found:
 
 		ctx->policy = TV_POLICY_ADAPTIVE;
 		pr_info("tieredvol: policy = adaptive\n");
+		tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "policy=adaptive");
 		return 0;
 	}
 	if (argc == 1 && strcmp(argv[0], "adaptive_off") == 0) {
@@ -551,6 +592,7 @@ found:
 
 		ctx->policy = TV_POLICY_STATIC;
 		pr_info("tieredvol: policy = static\n");
+		tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "policy=static");
 		return 0;
 	}
 	if (argc == 2 && strcmp(argv[0], "set_policy") == 0) {
@@ -565,6 +607,7 @@ found:
 		else
 			return -EINVAL;
 		pr_info("tieredvol: policy = %s\n", argv[1]);
+		tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "policy=%s", argv[1]);
 		return 0;
 	}
 	if (argc == 2 && strcmp(argv[0], "set_ema_shift") == 0) {
@@ -576,6 +619,7 @@ found:
 		ctx->ema_weight_shift = shift;
 		pr_info("tieredvol: ema_weight_shift=%u (alpha=%u/1024)\n",
 			shift, 1 << shift);
+		tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "ema_shift=%u", shift);
 		return 0;
 	}
 	if (argc == 2 && strcmp(argv[0], "set_stale_ms") == 0) {
@@ -586,6 +630,7 @@ found:
 			return -EINVAL;
 		ctx->stale_after_ns = (u64)ms * 1000000ULL;
 		pr_info("tieredvol: stale_after=%ums\n", ms);
+		tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "stale_ms=%u", ms);
 		return 0;
 	}
 	if (argc == 1 && strcmp(argv[0], "show_adaptive") == 0) {
@@ -662,6 +707,7 @@ found:
 			return -EINVAL;
 		ctx->wear_bias = bias;
 		pr_info("tieredvol: wear_bias=%u\n", bias);
+		tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "wear_bias=%u", bias);
 		return 0;
 	}
 	if (argc == 1 && strcmp(argv[0], "reset_wear") == 0) {
@@ -671,6 +717,7 @@ found:
 		for (i = 0; i < ctx->ndisks; i++)
 			ctx->total_write_bytes[i] = 0;
 		pr_info("tieredvol: wear counters reset\n");
+		tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "wear reset");
 		return 0;
 	}
 	if (argc == 1 && strcmp(argv[0], "show_mirror") == 0) {
@@ -710,6 +757,52 @@ found:
 		ctx->meta.segments[seg_idx].mirror_disk = disk_idx;
 		pr_info("tieredvol: seg%u mirror -> disk%u (%s)\n",
 			seg_idx, disk_idx, ctx->meta.disk_names[disk_idx]);
+		tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG,
+		       "mirror seg%u->disk%u", seg_idx, disk_idx);
+		return 0;
+	}
+	if (argc == 1 && strcmp(argv[0], "show_log") == 0) {
+		struct tv_log_entry entry;
+		unsigned long flags;
+		int cnt = 0;
+
+		spin_lock_irqsave(&tv_log_lock, flags);
+		while (kfifo_get(&tv_log_fifo, &entry)) {
+			pr_info("tieredvol: LOG %s %s: %s\n",
+				entry.level == TV_LOG_ERR ? "ERR" :
+				entry.level == TV_LOG_WARN ? "WRN" : "INF",
+				entry.event_type == TV_LOG_STALE ? "STALE" :
+				entry.event_type == TV_LOG_RECOVER ? "RCVR" :
+				entry.event_type == TV_LOG_MIRROR ? "MIRR" :
+				entry.event_type == TV_LOG_CONFIG ? "CONF" :
+				entry.event_type == TV_LOG_IO ? "I/O" : "???",
+				entry.msg);
+			cnt++;
+		}
+		spin_unlock_irqrestore(&tv_log_lock, flags);
+
+		if (cnt == 0)
+			pr_info("tieredvol: LOG EMPTY\n");
+		else
+			pr_info("tieredvol: LOG DUMPED %d entries\n", cnt);
+		return 0;
+	}
+	if (argc == 1 && strcmp(argv[0], "clear_log") == 0) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&tv_log_lock, flags);
+		kfifo_reset(&tv_log_fifo);
+		spin_unlock_irqrestore(&tv_log_lock, flags);
+		pr_info("tieredvol: log cleared\n");
+		return 0;
+	}
+	if (argc == 2 && strcmp(argv[0], "set_loglevel") == 0) {
+		u32 lvl;
+
+		if (kstrtou32(argv[1], 10, &lvl) || lvl > TV_LOG_INFO)
+			return -EINVAL;
+		tv_log_level = lvl;
+		pr_info("tieredvol: loglevel = %u\n", tv_log_level);
 		return 0;
 	}
 	return -EINVAL;

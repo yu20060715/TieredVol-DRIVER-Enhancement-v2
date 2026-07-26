@@ -93,4 +93,29 @@ struct tieredvol_map tv_map_logical_random(u64 logical,
 int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
 			    const char *path);
 
+#define TV_LOG_SIZE 512
+
+struct tv_log_entry {
+	u64  timestamp_ns;
+	u8   level;
+	u8   disk_idx;
+	u8   event_type;
+	char msg[48];
+};
+
+enum tv_log_level {
+	TV_LOG_OFF  = 0,
+	TV_LOG_ERR  = 1,
+	TV_LOG_WARN = 2,
+	TV_LOG_INFO = 3,
+};
+
+enum tv_log_event {
+	TV_LOG_IO      = 0,
+	TV_LOG_STALE   = 1,
+	TV_LOG_RECOVER = 2,
+	TV_LOG_MIRROR  = 3,
+	TV_LOG_CONFIG  = 4,
+};
+
 #endif

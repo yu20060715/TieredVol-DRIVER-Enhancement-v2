@@ -229,19 +229,27 @@
 
 ## 11. 結構化診斷日誌（NSC 計畫新增目標）
 
-| # | 功能 | 說明 | 參考專案 |
-|---|------|------|----------|
-| 58 | **Ring buffer** | 記錄 I/O 事件 | `kernel/trace/ring_buffer.c` |
-| 59 | **Log level** | 動態調整詳細程度 | ftrace event filtering |
-| 60 | **dmsetup query** | 即時查詢日誌 | DM message framework |
+| # | 功能 | 說明 | 測試？ |
+|---|------|------|:------:|
+| 58 | **Ring buffer** | `kfifo` 512 entries，記錄 I/O/stale/mirror/config 事件 | ✅ |
+| 59 | **Log level** | `set_loglevel 0-3` 動態調整詳細程度 | ✅ |
+| 60 | **dmsetup query** | `show_log` / `clear_log` 即時查詢清空日誌 | ✅ |
 
-**開源參考：**
-- `kernel/trace/ring_buffer.c` — 高效能 ring buffer 實作
+**實作參考（借用來源）：**
+
+| 參考專案 | 借鑒內容 | 連結 |
+|----------|----------|------|
+| **emlog** (nicupavel) | ring buffer 整體架構：固定大小 buffer、overflow 覆寫、rwlock 模式 | https://github.com/nicupavel/emlog |
+| **dm-log-writes** | 結構化 I/O 事件的欄位設計（`log_write_entry`：timestamp + sector + len + flags） | https://github.com/torvalds/linux/blob/master/drivers/md/dm-log-writes.c |
+| **dm-dust** | DM message query/result 模式：`dust_message()` 處理指令 + `DMINFO()` 回傳結果 | https://github.com/torvalds/linux/blob/master/drivers/md/dm-dust.c |
+| **sysprog21/kfifo-examples** | kfifo 基本用法：`DECLARE_KFIFO` + `kfifo_in/out` + mutex | https://github.com/sysprog21/kfifo-examples |
+| **kernel/samples/kfifo/record-example.c** | 變長紀錄 kfifo：`kfifo_rec_ptr_1` + `kfifo_peek_len()` | https://github.com/torvalds/linux/blob/master/samples/kfifo/record-example.c |
+
+**開源參考（官方 kernel）：**
+- `kernel/trace/ring_buffer.c` — 高效能 lockless ring buffer 參考實作
   - https://github.com/torvalds/linux/blob/master/kernel/trace/ring_buffer.c
 - `kernel/trace/trace.c` — trace event 管理 + log level 控制
   - https://github.com/torvalds/linux/blob/master/kernel/trace/trace.c
-- `drivers/md/dm-dust.c` — DM message 結果回傳（`result` buffer）
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-dust.c
 - `include/linux/ring_buffer.h` — ring buffer API 頭檔
   - https://github.com/torvalds/linux/blob/master/include/linux/ring_buffer.h
 
@@ -260,7 +268,8 @@
 | DM lifecycle | 7 | 7 |
 | Status | 3 | 3 |
 | Metadata | 3 | 3 |
-| **Total** | **53** | **53** |
+| Structured logging | 3 | 3 |
+| **Total** | **56** | **56** |
 
 ---
 

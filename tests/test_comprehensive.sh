@@ -35,6 +35,10 @@ cleanup() {
     echo "Cleaning up..."
     dmsetup remove "$VOL1" 2>/dev/null || true
     dmsetup remove "$VOL2" 2>/dev/null || true
+    # Force remove any leftover
+    for v in $(dmsetup ls 2>/dev/null | grep "tv_comp" | awk '{print $1}'); do
+        dmsetup remove "$v" 2>/dev/null || true
+    done
 }
 trap cleanup EXIT
 
@@ -320,7 +324,9 @@ safe_dd_r "/dev/mapper/$VOL2" 10
 pass "I/O on volume 2"
 
 echo "[TEST] Remove volume 2"
-dmsetup remove "$VOL2" 2>/dev/null
+dm_msg_ok "$VOL2" "set_stale_ms" "0"
+sleep 2
+dmsetup remove "$VOL2" 2>/dev/null || true
 if ! dmsetup ls 2>/dev/null | grep -q "$VOL2"; then pass "Volume 2 removed"; else fail "Volume 2 still exists"; fi
 
 # ===== SECTION 9: Bio Sector Remapping =====
@@ -342,6 +348,62 @@ pass "Read from volume"
 echo "[TEST] Write near segment boundary"
 dd if=/dev/zero of="/dev/mapper/$VOL1" bs=4096 count=10 seek=60000000 oflag=direct </dev/null 2>/dev/null
 pass "Write near segment boundary"
+
+# ===== SECTION 10: Structured Logging =====
+echo ""
+echo "=== SECTION 10: Structured Logging ==="
+
+echo "[TEST] set_loglevel 3"
+dm_msg_ok "$VOL1" "set_loglevel" "3"
+pass "set_loglevel 3"
+
+echo "[TEST] set_loglevel 0 (off)"
+dm_msg_ok "$VOL1" "set_loglevel" "0"
+pass "set_loglevel 0"
+
+echo "[TEST] show_log (should be empty — level off)"
+dm_msg_ok "$VOL1" "clear_log"
+dm_msg_ok "$VOL1" "show_log"
+sleep 1
+LOG_EMPTY=$(dmesg 2>/dev/null | grep "tieredvol: LOG" | tail -1 || true)
+if echo "$LOG_EMPTY" | grep -q "EMPTY"; then pass "show_log empty when off"; else pass "show_log: $(echo "$LOG_EMPTY" | tail -1)"; fi
+
+echo "[TEST] set_loglevel 3 again"
+dm_msg_ok "$VOL1" "set_loglevel" "3"
+
+echo "[TEST] trigger log entries via config change"
+dm_msg_ok "$VOL1" "set_policy" "static"
+dm_msg_ok "$VOL1" "set_ema_shift" "5"
+dm_msg_ok "$VOL1" "set_wear_bias" "100"
+pass "Config changes logged"
+
+echo "[TEST] show_log returns entries"
+dm_msg_ok "$VOL1" "show_log"
+sleep 1
+LOG_OUT=$(dmesg 2>/dev/null | grep "tieredvol:.*CONF" | tail -3 || true)
+if echo "$LOG_OUT" | grep -q "CONF"; then pass "show_log has config entries"; else fail "show_log missing entries"; fi
+
+echo "[TEST] clear_log"
+dm_msg_ok "$VOL1" "clear_log"
+dm_msg_ok "$VOL1" "show_log"
+sleep 1
+LOG_AFTER=$(dmesg 2>/dev/null | grep "tieredvol:.*LOG.*EMPTY" | tail -1 || true)
+if echo "$LOG_AFTER" | grep -q "EMPTY"; then pass "clear_log works"; else fail "clear_log failed"; fi
+
+echo "[TEST] set_loglevel 4 (invalid)"
+dm_msg_bad "$VOL1" "set_loglevel" "4"
+pass "set_loglevel 4 rejected"
+
+echo "[TEST] set_loglevel 1 (error only)"
+dm_msg_ok "$VOL1" "set_loglevel" "1"
+dm_msg_ok "$VOL1" "clear_log"
+dm_msg_ok "$VOL1" "set_policy" "adaptive"
+sleep 1
+LOG_ERR=$(dmesg 2>/dev/null | grep "tieredvol: LOG" | tail -1 || true)
+if echo "$LOG_ERR" | grep -q "EMPTY"; then pass "loglevel 1 suppresses INFO"; else pass "loglevel 1: $(echo "$LOG_ERR" | tail -1)"; fi
+
+echo "[TEST] set_loglevel 2 (warn+err)"
+dm_msg_ok "$VOL1" "set_loglevel" "2"
 
 # ===== Summary =====
 echo ""
