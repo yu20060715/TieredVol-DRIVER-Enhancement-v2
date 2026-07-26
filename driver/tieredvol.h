@@ -83,6 +83,8 @@ struct tieredvol_ctx {
 	u64 mirror_write_bytes;
 	u64 mirror_write_ops;
 	u64 mirror_errors;
+	bool degraded[TV_MAX_DISKS];
+	u32 error_threshold;
 	struct work_struct trigger_event;
 };
 
@@ -92,6 +94,7 @@ struct tieredvol_map tv_map_logical(u64 logical,
 struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 					    struct tieredvol_metadata *meta,
 					    u64 *ema_load, bool *stale,
+					    bool *degraded,
 					    int ndisks,
 					    u64 *total_write_bytes,
 					    u32 wear_bias,

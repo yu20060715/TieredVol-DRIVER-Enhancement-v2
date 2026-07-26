@@ -82,6 +82,7 @@ struct tieredvol_map tv_map_logical(u64 logical,
 struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 					    struct tieredvol_metadata *meta,
 					    u64 *ema_load, bool *stale,
+					    bool *degraded,
 					    int ndisks,
 					    u64 *total_write_bytes,
 					    u32 wear_bias,
@@ -123,6 +124,8 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 		if (d >= (u32)ndisks)
 			continue;
 		if (stale[d])
+			continue;
+		if (degraded && degraded[d])
 			continue;
 
 		load = ema_load[d];

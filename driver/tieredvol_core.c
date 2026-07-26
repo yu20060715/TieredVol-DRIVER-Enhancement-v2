@@ -275,7 +275,6 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 	struct tieredvol_ctx *ctx = ti->private;
 	u64 logical;
 	struct tieredvol_map cur;
-	int ret;
 
 	logical = (u64)bio->bi_iter.bi_sector << SECTOR_SHIFT;
 
@@ -283,6 +282,7 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 	case TV_POLICY_ADAPTIVE:
 		cur = tv_map_logical_adaptive(logical, &ctx->meta,
 					      ctx->ema_load, ctx->stale,
+					      ctx->degraded,
 					      ctx->ndisks,
 					      ctx->total_write_bytes,
 					      ctx->wear_bias,
@@ -384,11 +384,23 @@ static int tieredvol_end_io(struct dm_target *ti, struct bio *bio,
 
 		for (i = 0; i < ctx->ndisks; i++) {
 			if (bio->bi_bdev == ctx->devs[i]->bdev) {
-				atomic_inc(&ctx->error_count[i]);
+				int errs = atomic_inc_return(&ctx->error_count[i]);
+
 				tv_log(TV_LOG_ERR, i, TV_LOG_IO,
-				       "I/O error on %s status=%d",
+				       "I/O error on %s status=%d err=%d",
 				       ctx->meta.disk_names[i],
-				       bio->bi_status);
+				       bio->bi_status, errs);
+
+				if (!ctx->degraded[i] &&
+				    errs >= (int)ctx->error_threshold) {
+					ctx->degraded[i] = true;
+					pr_warn("tieredvol: disk[%d] %s DEGRADED (errors=%d >= threshold=%u)\n",
+						i, ctx->meta.disk_names[i],
+						errs, ctx->error_threshold);
+					tv_log(TV_LOG_WARN, i, TV_LOG_IO,
+					       "DEGRADED err=%d", errs);
+					schedule_work(&ctx->trigger_event);
+				}
 
 				/* Mirror read fallback (1c) */
 				if (bio_data_dir(bio) == READ) {
@@ -497,6 +509,7 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 	ctx->mirror_write_bytes = 0;
 	ctx->mirror_write_ops = 0;
 	ctx->mirror_errors = 0;
+	ctx->error_threshold = 10;
 
 	timer_setup(&ctx->decay_timer, tv_decay_timer_fn, 0);
 	mod_timer(&ctx->decay_timer, jiffies + TV_DECAY_INTERVAL);
@@ -678,11 +691,15 @@ static void tieredvol_status(struct dm_target *ti, status_type_t type,
 				ctx->mirror_errors);
 
 		for (i = 0; i < ctx->ndisks && off < (int)maxlen - 2; i++) {
-			char status = 'A';
+			char status;
 
-			if (ctx->error_count &&
-			    atomic_read(&ctx->error_count[i]))
+			if (ctx->degraded[i])
 				status = 'D';
+			else if (ctx->error_count &&
+				 atomic_read(&ctx->error_count[i]))
+				status = 'E';
+			else
+				status = 'A';
 
 			off += snprintf(result + off, maxlen - off,
 					" %c%s:rd=%llu/%llu wr=%llu/%llu",
@@ -795,7 +812,7 @@ static int tv_metadata_save_kernel(struct tieredvol_ctx *ctx)
 
 		bak = filp_open(bak_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		if (!IS_ERR(bak)) {
-			char kbuf[4096];
+			char kbuf[256];
 			loff_t rpos = 0, wpos = 0;
 			ssize_t nrd;
 
@@ -1146,6 +1163,48 @@ found:
 		tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "errors reset");
 		return 0;
 	}
+	if (argc == 2 && strcmp(argv[0], "set_error_threshold") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+		u32 thresh;
+
+		if (kstrtou32(argv[1], 10, &thresh) || thresh == 0)
+			return -EINVAL;
+		ctx->error_threshold = thresh;
+		pr_info("tieredvol: error_threshold=%u\n", thresh);
+		tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "err_thresh=%u", thresh);
+		return 0;
+	}
+	if (argc == 1 && strcmp(argv[0], "show_degraded") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+		int i, off = 0;
+
+		for (i = 0; i < ctx->ndisks && off < (int)maxlen - 2; i++) {
+			off += snprintf(result + off, maxlen - off,
+					"%s%s=%c(err=%d)",
+					i > 0 ? " " : "",
+					ctx->meta.disk_names[i],
+					ctx->degraded[i] ? 'D' : 'A',
+					atomic_read(&ctx->error_count[i]));
+		}
+		return 0;
+	}
+	if (argc == 1 && strcmp(argv[0], "clear_degraded") == 0) {
+		struct tieredvol_ctx *ctx = ti->private;
+		int i, cleared = 0;
+
+		for (i = 0; i < ctx->ndisks; i++) {
+			if (ctx->degraded[i]) {
+				ctx->degraded[i] = false;
+				atomic_set(&ctx->error_count[i], 0);
+				cleared++;
+				pr_info("tieredvol: disk[%d] %s cleared from DEGRADED\n",
+					i, ctx->meta.disk_names[i]);
+				tv_log(TV_LOG_INFO, i, TV_LOG_IO, "CLEARED degraded");
+			}
+		}
+		snprintf(result, maxlen, "%d disk(s) cleared", cleared);
+		return 0;
+	}
 	return -EINVAL;
 }
 
@@ -1334,9 +1393,10 @@ static ssize_t status_show(struct kobject *kobj, struct kobj_attribute *attr,
 
 	for (i = 0; i < ctx->ndisks; i++) {
 		off += sysfs_emit_at(buf, off,
-				     "%s: err=%d rd=%llu/%llu wr=%llu/%llu stale=%d ema=%llu\n",
+				     "%s: err=%d %s rd=%llu/%llu wr=%llu/%llu stale=%d ema=%llu\n",
 				     ctx->meta.disk_names[i],
 				     atomic_read(&ctx->error_count[i]),
+				     ctx->degraded[i] ? "DEGRADED" : "active",
 				     ctx->total_read_ops[i],
 				     ctx->total_read_bytes[i],
 				     ctx->total_write_ops[i],

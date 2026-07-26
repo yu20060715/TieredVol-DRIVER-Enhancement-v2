@@ -22,7 +22,15 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; NC='\033[0m'
 pass() { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC}  $*"; }
 fail() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC}  $*"; }
 
-dm_msg_ok() { dmsetup message "$1" 0 "$2" ${3:-} ${4:-} 2>/dev/null; }
+dm_msg_ok() {
+    local ret=0
+    dmsetup message "$1" 0 "$2" ${3:-} ${4:-} 2>/dev/null || ret=$?
+    if [ $ret -ne 0 ]; then
+        sleep 1
+        dmsetup message "$1" 0 "$2" ${3:-} ${4:-} 2>/dev/null || ret=$?
+    fi
+    return $ret
+}
 dm_msg_bad() { ! dmsetup message "$1" 0 "$2" ${3:-} ${4:-} 2>/dev/null; }
 
 safe_dd_w() { dd if=/dev/zero of="$1" bs=4096 count="${2:-100}" oflag=direct </dev/null 2>/dev/null; }
@@ -33,6 +41,11 @@ VOL2="tv_comp2_$$"
 
 cleanup() {
     echo "Cleaning up..."
+    # Disable stale timer first to prevent dmsetup remove hangs
+    for v in $(dmsetup ls 2>/dev/null | grep -E "tv_comp|tv_" | awk '{print $1}'); do
+        dmsetup message "$v" 0 set_stale_ms 0 2>/dev/null || true
+    done
+    sleep 2
     dmsetup remove "$VOL1" 2>/dev/null || true
     dmsetup remove "$VOL2" 2>/dev/null || true
     # Force remove any leftover
