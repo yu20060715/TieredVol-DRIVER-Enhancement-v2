@@ -812,8 +812,7 @@ static struct target_type tieredvol_target = {
 	.name   = "tieredvol",
 	.version = {2, 0, 0},
 	.module = THIS_MODULE,
-	.features = DM_TARGET_NOWAIT | DM_TARGET_PASSES_INTEGRITY |
-		    DM_TARGET_ATOMIC_WRITES | DM_TARGET_PASSES_CRYPTO,
+	.features = DM_TARGET_NOWAIT | DM_TARGET_PASSES_CRYPTO,
 	.ctr    = tieredvol_ctr,
 	.dtr    = tieredvol_dtr,
 	.map    = tieredvol_map,
