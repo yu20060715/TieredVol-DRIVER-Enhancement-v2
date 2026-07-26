@@ -627,6 +627,8 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 	ctx->rebuild_offset = 0;
 	ctx->rebuild_total = 0;
 	atomic_set(&ctx->rebuild_running, 0);
+	init_completion(&ctx->rebuild_done_r);
+	init_completion(&ctx->rebuild_done_w);
 
 	timer_setup(&ctx->decay_timer, tv_decay_timer_fn, 0);
 	mod_timer(&ctx->decay_timer, jiffies + TV_DECAY_INTERVAL);
@@ -995,11 +997,9 @@ static int tv_rebuild_thread(void *data)
 	struct bio *bio_r, *bio_w;
 	int disk_idx;
 	unsigned int chunk_bytes;
-	DECLARE_COMPLETION_ONSTACK(done_r);
-	DECLARE_COMPLETION_ONSTACK(done_w);
 
 	while (!kthread_should_stop()) {
-		if (atomic_read(&ctx->rebuild_running) == 0)
+		if (!atomic_read(&ctx->rebuild_running))
 			break;
 
 		seg = &ctx->meta.segments[ctx->rebuild_seg_idx];
@@ -1018,7 +1018,6 @@ static int tv_rebuild_thread(void *data)
 			break;
 		}
 
-		/* Read from primary disk */
 		{
 			struct page *pg;
 
@@ -1028,7 +1027,8 @@ static int tv_rebuild_thread(void *data)
 				continue;
 			}
 
-			reinit_completion(&done_r);
+			/* Read from primary disk */
+			reinit_completion(&ctx->rebuild_done_r);
 
 			bio_r = bio_alloc(ctx->devs[disk_idx]->bdev,
 					  1, REQ_OP_READ, GFP_NOIO);
@@ -1040,7 +1040,7 @@ static int tv_rebuild_thread(void *data)
 			bio_r->bi_iter.bi_sector = (ctx->rebuild_offset +
 						     seg->logical_begin) >> SECTOR_SHIFT;
 			bio_r->bi_iter.bi_size = chunk_bytes;
-			bio_r->bi_private = &done_r;
+			bio_r->bi_private = &ctx->rebuild_done_r;
 			bio_r->bi_end_io = tv_rebuild_end_io;
 
 			if (bio_add_page(bio_r, pg, chunk_bytes, 0) != chunk_bytes) {
@@ -1051,7 +1051,7 @@ static int tv_rebuild_thread(void *data)
 			}
 
 			submit_bio(bio_r);
-			wait_for_completion(&done_r);
+			wait_for_completion(&ctx->rebuild_done_r);
 
 			if (bio_r->bi_status != BLK_STS_OK) {
 				pr_err("tieredvol: rebuild read failed at offset %llu\n",
@@ -1063,8 +1063,14 @@ static int tv_rebuild_thread(void *data)
 			}
 			bio_put(bio_r);
 
+			/* Check flag before write */
+			if (!atomic_read(&ctx->rebuild_running)) {
+				put_page(pg);
+				break;
+			}
+
 			/* Write to mirror disk */
-			reinit_completion(&done_w);
+			reinit_completion(&ctx->rebuild_done_w);
 
 			bio_w = bio_alloc(ctx->devs[seg->mirror_disk]->bdev,
 					  1, REQ_OP_WRITE, GFP_NOIO);
@@ -1076,7 +1082,7 @@ static int tv_rebuild_thread(void *data)
 			bio_w->bi_iter.bi_sector = (ctx->rebuild_offset +
 						     seg->logical_begin) >> SECTOR_SHIFT;
 			bio_w->bi_iter.bi_size = chunk_bytes;
-			bio_w->bi_private = &done_w;
+			bio_w->bi_private = &ctx->rebuild_done_w;
 			bio_w->bi_end_io = tv_rebuild_end_io;
 
 			if (bio_add_page(bio_w, pg, chunk_bytes, 0) != chunk_bytes) {
@@ -1087,7 +1093,7 @@ static int tv_rebuild_thread(void *data)
 			}
 
 			submit_bio(bio_w);
-			wait_for_completion(&done_w);
+			wait_for_completion(&ctx->rebuild_done_w);
 
 			if (bio_w->bi_status != BLK_STS_OK) {
 				pr_err("tieredvol: rebuild write failed at offset %llu\n",
@@ -1480,13 +1486,18 @@ found:
 		snprintf(result, maxlen, "%d disk(s) cleared", cleared);
 		return 0;
 	}
-	if (argc == 2 && strcmp(argv[0], "start_rebuild") == 0) {
+	if (argc >= 2 && strcmp(argv[0], "start_rebuild") == 0) {
 		struct tieredvol_ctx *ctx = ti->private;
 		u32 seg_idx;
+		u64 max_bytes = 0;
 
 		if (kstrtou32(argv[1], 10, &seg_idx) ||
 		    seg_idx >= ctx->meta.segment_count)
 			return -EINVAL;
+		if (argc >= 3) {
+			if (kstrtou64(argv[2], 10, &max_bytes) || max_bytes == 0)
+				return -EINVAL;
+		}
 		if (atomic_read(&ctx->rebuild_running))
 			return -EBUSY;
 		if (!ctx->meta.segments[seg_idx].mirror_enabled)
@@ -1496,7 +1507,11 @@ found:
 		ctx->rebuild_offset = 0;
 		ctx->rebuild_total = ctx->meta.segments[seg_idx].logical_end -
 				     ctx->meta.segments[seg_idx].logical_begin;
+		if (max_bytes > 0 && max_bytes < ctx->rebuild_total)
+			ctx->rebuild_total = max_bytes;
 		atomic_set(&ctx->rebuild_running, 1);
+		reinit_completion(&ctx->rebuild_done_r);
+		reinit_completion(&ctx->rebuild_done_w);
 
 		ctx->rebuild_thread = kthread_run(tv_rebuild_thread, ctx,
 						  "tv_rebuild_%d", seg_idx);
@@ -1504,7 +1519,7 @@ found:
 			atomic_set(&ctx->rebuild_running, 0);
 			return PTR_ERR(ctx->rebuild_thread);
 		}
-		pr_info("tieredvol: rebuild started for seg%u (%llu bytes)\n",
+		pr_info("tieredvol: rebuild started seg%u %llu bytes\n",
 			seg_idx, ctx->rebuild_total);
 		tv_log(TV_LOG_INFO, ctx->meta.segments[seg_idx].mirror_disk,
 		       TV_LOG_MIRROR, "rebuild start seg%u %llu bytes",
@@ -1517,6 +1532,9 @@ found:
 		if (!atomic_read(&ctx->rebuild_running))
 			return 0;
 		atomic_set(&ctx->rebuild_running, 0);
+		/* Unblock thread if stuck in wait_for_completion */
+		complete(&ctx->rebuild_done_r);
+		complete(&ctx->rebuild_done_w);
 		if (!IS_ERR_OR_NULL(ctx->rebuild_thread)) {
 			kthread_stop(ctx->rebuild_thread);
 			ctx->rebuild_thread = NULL;

@@ -91,6 +91,8 @@ struct tieredvol_ctx {
 	u64 rebuild_offset;
 	u64 rebuild_total;
 	atomic_t rebuild_running;
+	struct completion rebuild_done_r;
+	struct completion rebuild_done_w;
 	struct work_struct trigger_event;
 };
 
