@@ -1,6 +1,5 @@
 # Build artifacts (userspace)
 tiered_setup
-tiered_io
 test_common
 test_mapper
 test_partition
