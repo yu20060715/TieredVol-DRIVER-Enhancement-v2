@@ -746,6 +746,8 @@ static void tieredvol_dtr(struct dm_target *ti)
 	/* Stop rebuild thread if running */
 	if (atomic_read(&ctx->rebuild_running)) {
 		atomic_set(&ctx->rebuild_running, 0);
+		complete(&ctx->rebuild_done_r);
+		complete(&ctx->rebuild_done_w);
 		if (!IS_ERR_OR_NULL(ctx->rebuild_thread))
 			kthread_stop(ctx->rebuild_thread);
 	}
@@ -995,7 +997,6 @@ static int tv_rebuild_thread(void *data)
 	struct tieredvol_ctx *ctx = data;
 	struct tieredvol_segment *seg;
 	struct bio *bio_r, *bio_w;
-	int disk_idx;
 	unsigned int chunk_bytes;
 
 	while (!kthread_should_stop()) {
@@ -1003,7 +1004,6 @@ static int tv_rebuild_thread(void *data)
 			break;
 
 		seg = &ctx->meta.segments[ctx->rebuild_seg_idx];
-		disk_idx = (int)seg->disk_index[0];
 		chunk_bytes = ctx->meta.chunk_size;
 
 		/* Check if rebuild is complete */
@@ -1020,6 +1020,17 @@ static int tv_rebuild_thread(void *data)
 
 		{
 			struct page *pg;
+			u64 logical_addr;
+			struct tieredvol_map cur;
+
+			/* Compute correct physical offset via tv_map_logical */
+			logical_addr = ctx->rebuild_offset + seg->logical_begin;
+			cur = tv_map_logical(logical_addr, &ctx->meta,
+					     ctx->meta.chunk_size);
+			if (cur.disk < 0 || cur.length == 0) {
+				msleep(10);
+				continue;
+			}
 
 			pg = alloc_page(GFP_NOIO);
 			if (!pg) {
@@ -1030,15 +1041,14 @@ static int tv_rebuild_thread(void *data)
 			/* Read from primary disk */
 			reinit_completion(&ctx->rebuild_done_r);
 
-			bio_r = bio_alloc(ctx->devs[disk_idx]->bdev,
+			bio_r = bio_alloc(ctx->devs[cur.disk]->bdev,
 					  1, REQ_OP_READ, GFP_NOIO);
 			if (!bio_r) {
 				put_page(pg);
 				msleep(10);
 				continue;
 			}
-			bio_r->bi_iter.bi_sector = (ctx->rebuild_offset +
-						     seg->logical_begin) >> SECTOR_SHIFT;
+			bio_r->bi_iter.bi_sector = cur.offset >> SECTOR_SHIFT;
 			bio_r->bi_iter.bi_size = chunk_bytes;
 			bio_r->bi_private = &ctx->rebuild_done_r;
 			bio_r->bi_end_io = tv_rebuild_end_io;
@@ -1079,8 +1089,7 @@ static int tv_rebuild_thread(void *data)
 				msleep(10);
 				continue;
 			}
-			bio_w->bi_iter.bi_sector = (ctx->rebuild_offset +
-						     seg->logical_begin) >> SECTOR_SHIFT;
+			bio_w->bi_iter.bi_sector = cur.offset >> SECTOR_SHIFT;
 			bio_w->bi_iter.bi_size = chunk_bytes;
 			bio_w->bi_private = &ctx->rebuild_done_w;
 			bio_w->bi_end_io = tv_rebuild_end_io;
