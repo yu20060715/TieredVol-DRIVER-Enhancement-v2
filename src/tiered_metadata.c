@@ -1,49 +1,91 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <unistd.h>
 #include "tiered_types.h"
+
+/* CRC32C (Castagnoli) — matches kernel crc32c */
+static uint32_t crc32c_table[256];
+static int crc32c_initialized = 0;
+
+static void crc32c_init(void) {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t crc = i;
+        for (int j = 0; j < 8; j++)
+            crc = (crc >> 1) ^ (0x82F63B78u & (-(crc & 1)));
+        crc32c_table[i] = crc;
+    }
+    crc32c_initialized = 1;
+}
+
+static uint32_t crc32c_calc(const char *data, size_t len) {
+    uint32_t crc = 0;  /* match kernel crc32c() initial value */
+    if (!crc32c_initialized) crc32c_init();
+    for (size_t i = 0; i < len; i++)
+        crc = crc32c_table[(crc ^ (uint8_t)data[i]) & 0xFF] ^ (crc >> 8);
+    return crc;  /* no finalization XOR — matches kernel crc32c() */
+}
 
 int tv_metadata_save(TV_METADATA *meta, const char *path) {
     if (!meta || !path) return TV_ERR;
 
+    /* Build content to a temp buffer for CRC computation */
+    char buf[16384];
+    int off = 0;
+
+    off += snprintf(buf + off, sizeof(buf) - off, "[weighted_striping]\n");
+    off += snprintf(buf + off, sizeof(buf) - off, "version=%u\n", meta->version);
+    off += snprintf(buf + off, sizeof(buf) - off, "chunk_size=%u\n", meta->chunk_size);
+    off += snprintf(buf + off, sizeof(buf) - off, "segment_count=%u\n", meta->segment_count);
+    off += snprintf(buf + off, sizeof(buf) - off, "disk_count=%u\n", meta->disk_count);
+
+    for (uint32_t i = 0; i < meta->disk_count; i++) {
+        off += snprintf(buf + off, sizeof(buf) - off, "disk%u_name=%s\n", i, meta->disk_names[i]);
+    }
+
+    for (uint32_t i = 0; i < meta->segment_count; i++) {
+        TV_SEGMENT *seg = &meta->segments[i];
+        off += snprintf(buf + off, sizeof(buf) - off, "seg%u_begin=%lu\n", i, (unsigned long)seg->logical_begin);
+        off += snprintf(buf + off, sizeof(buf) - off, "seg%u_end=%lu\n", i, (unsigned long)seg->logical_end);
+        off += snprintf(buf + off, sizeof(buf) - off, "seg%u_count=%u\n", i, seg->disk_count);
+
+        off += snprintf(buf + off, sizeof(buf) - off, "seg%u_disks=", i);
+        for (uint32_t j = 0; j < seg->disk_count; j++) {
+            off += snprintf(buf + off, sizeof(buf) - off, "%s%u", j ? "," : "", seg->disk_index[j]);
+        }
+        off += snprintf(buf + off, sizeof(buf) - off, "\n");
+
+        off += snprintf(buf + off, sizeof(buf) - off, "seg%u_weight=", i);
+        for (uint32_t j = 0; j < seg->disk_count; j++) {
+            off += snprintf(buf + off, sizeof(buf) - off, "%s%u", j ? "," : "", seg->weight[j]);
+        }
+        off += snprintf(buf + off, sizeof(buf) - off, "\n");
+
+        off += snprintf(buf + off, sizeof(buf) - off, "seg%u_stripe=%lu\n", i, (unsigned long)seg->stripe_size);
+    }
+
+    /* Compute CRC32C */
+    uint32_t crc = crc32c_calc(buf, off);
+
+    /* Write backup of current file if it exists */
+    char bak_path[256];
+    snprintf(bak_path, sizeof(bak_path), "%s.bak", path);
+    unlink(bak_path);
+    rename(path, bak_path);
+
+    /* Write new file with CRC */
     FILE *f = fopen(path, "w");
     if (!f) {
         fprintf(stderr, "metadata: cannot write to '%s'\n", path);
         return TV_ERR;
     }
 
-    fprintf(f, "[weighted_striping]\n");
-    fprintf(f, "version=%u\n", meta->version);
-    fprintf(f, "chunk_size=%u\n", meta->chunk_size);
-    fprintf(f, "segment_count=%u\n", meta->segment_count);
-    fprintf(f, "disk_count=%u\n", meta->disk_count);
-
-    for (uint32_t i = 0; i < meta->disk_count; i++) {
-        fprintf(f, "disk%u_name=%s\n", i, meta->disk_names[i]);
-    }
-
-    for (uint32_t i = 0; i < meta->segment_count; i++) {
-        TV_SEGMENT *seg = &meta->segments[i];
-        fprintf(f, "seg%u_begin=%lu\n", i, (unsigned long)seg->logical_begin);
-        fprintf(f, "seg%u_end=%lu\n", i, (unsigned long)seg->logical_end);
-        fprintf(f, "seg%u_count=%u\n", i, seg->disk_count);
-
-        fprintf(f, "seg%u_disks=", i);
-        for (uint32_t j = 0; j < seg->disk_count; j++) {
-            fprintf(f, "%s%u", j ? "," : "", seg->disk_index[j]);
-        }
-        fprintf(f, "\n");
-
-        fprintf(f, "seg%u_weight=", i);
-        for (uint32_t j = 0; j < seg->disk_count; j++) {
-            fprintf(f, "%s%u", j ? "," : "", seg->weight[j]);
-        }
-        fprintf(f, "\n");
-
-        fprintf(f, "seg%u_stripe=%lu\n", i, (unsigned long)seg->stripe_size);
-    }
-
+    fwrite(buf, 1, off, f);
+    fprintf(f, "crc32=%u\n", crc);
     fclose(f);
+
+    fprintf(stderr, "metadata: saved with CRC32=0x%08X to '%s'\n", crc, path);
     return 0;
 }
 

@@ -2,6 +2,7 @@
 #include <linux/string.h>
 #include <linux/vmalloc.h>
 #include <linux/fs.h>
+#include <linux/crc32c.h>
 #include "tieredvol.h"
 
 #define TV_MAX_CONFIG_SIZE (1024 * 1024)
@@ -90,6 +91,25 @@ static int parse_num_prefix(const char *s, unsigned long *idx,
 	return 0;
 }
 
+/* Compute CRC32C over file content, excluding lines containing "crc32=" */
+static u32 tv_compute_config_crc(const char *buf)
+{
+	const char *p = buf;
+	u32 crc = 0;
+
+	while (*p) {
+		const char *nl = strchr(p, '\n');
+		size_t len = nl ? (size_t)(nl - p + 1) : strlen(p);
+
+		/* Skip lines containing "crc32=" */
+		if (len < 7 || memcmp(p, "crc32=", 6) != 0)
+			crc = crc32c(crc, p, len);
+
+		p = nl ? nl + 1 : p + len;
+	}
+	return crc;
+}
+
 int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
 			    const char *path)
 {
@@ -98,9 +118,8 @@ int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
 	char *buf;
 	char *line, *next_line;
 	int ret = 0;
-
-	if (!meta || !path)
-		return -EINVAL;
+	u32 expected_crc = 0;
+	bool has_crc = false;
 
 	f = filp_open(path, O_RDONLY, 0);
 	if (IS_ERR(f))
@@ -135,6 +154,19 @@ int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
 
 	memset(meta, 0, sizeof(*meta));
 
+	/* CRC32 validation — must be computed before parsing modifies buf */
+	if (has_crc) {
+		u32 actual_crc = tv_compute_config_crc(buf);
+
+		if (actual_crc != expected_crc) {
+			pr_err("tieredvol: config CRC mismatch (expected=0x%08x actual=0x%08x) — file may be corrupted\n",
+			       expected_crc, actual_crc);
+			ret = -EIO;
+			goto out;
+		}
+		pr_info("tieredvol: config CRC OK (0x%08x)\n", actual_crc);
+	}
+
 	for (line = buf; line && *line; line = next_line) {
 		char *k, *v;
 		unsigned long idx;
@@ -146,6 +178,12 @@ int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
 
 		if (parse_line(line, &k, &v) < 0)
 			continue;
+
+		if (strcmp(k, "crc32") == 0) {
+			if (kstrtou32(v, 10, &expected_crc) == 0)
+				has_crc = true;
+			continue;
+		}
 
 		if (strcmp(k, "version") == 0) {
 			if (parse_u32(v, &meta->version) < 0) {
