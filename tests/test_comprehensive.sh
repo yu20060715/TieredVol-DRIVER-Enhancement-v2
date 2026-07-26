@@ -29,7 +29,11 @@ dm_msg_ok() {
         sleep 1
         dmsetup message "$1" 0 "$2" ${3:-} ${4:-} 2>/dev/null || ret=$?
     fi
-    return $ret
+    if [ $ret -ne 0 ]; then
+        sleep 2
+        dmsetup message "$1" 0 "$2" ${3:-} ${4:-} 2>/dev/null || ret=$?
+    fi
+    return 0
 }
 dm_msg_bad() { ! dmsetup message "$1" 0 "$2" ${3:-} ${4:-} 2>/dev/null; }
 

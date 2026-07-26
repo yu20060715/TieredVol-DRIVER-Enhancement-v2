@@ -32,6 +32,14 @@ static struct tieredvol_ctx *tv_active_ctx;
 
 static struct workqueue_struct *tv_wq;
 
+/* Forward declarations for pending-write tracking (1b) */
+static void tv_pw_add(struct block_device *bdev, sector_t sector,
+		      unsigned int size);
+static void tv_pw_remove(struct block_device *bdev, sector_t sector,
+			 unsigned int size);
+static bool tv_pw_is_pending(struct block_device *bdev, sector_t sector,
+			     unsigned int size);
+
 static DEFINE_PER_CPU(u64, tv_map_count);
 static DEFINE_PER_CPU(u64, tv_map_sectors);
 static DEFINE_PER_CPU(u64, tv_map_bytes);
@@ -165,6 +173,9 @@ static void tv_mirror_end_io(struct bio *bio)
 	else
 		bio_ctx->mirror_write_ops++;
 
+	/* 1b: Remove from pending-write tracking — mirror write done */
+	tv_pw_remove(bio->bi_bdev, bio->bi_iter.bi_sector, bio->bi_iter.bi_size);
+
 	bio_put(bio);
 }
 
@@ -185,6 +196,24 @@ static struct tv_pending_read tv_pending_reads[TV_PENDING_MAX];
 static unsigned int tv_pending_head;
 static unsigned int tv_pending_count;
 static DEFINE_SPINLOCK(tv_pending_lock);
+
+/*
+ * Pending-write tracking for mirror write ordering (1b).
+ * When a mirror write is submitted, we add an entry. When it completes
+ * (tv_mirror_end_io), we remove it. Read retries check this before
+ * retrying on the mirror — if a write is still pending, the retry
+ * is rescheduled after a short delay.
+ */
+struct tv_pending_write {
+	struct block_device *bdev;
+	sector_t sector;
+	unsigned int size;
+};
+
+static struct tv_pending_write tv_pending_writes[TV_PENDING_MAX];
+static unsigned int tv_pw_head;
+static unsigned int tv_pw_count;
+static DEFINE_SPINLOCK(tv_pw_lock);
 
 static void tv_pending_add(struct block_device *bdev, sector_t sector,
 			   unsigned int size, int mirror_disk)
@@ -235,8 +264,73 @@ static int tv_pending_find_and_remove(struct block_device *bdev, sector_t sector
 	return mirror_disk;
 }
 
+static void tv_pw_add(struct block_device *bdev, sector_t sector,
+		      unsigned int size)
+{
+	unsigned long flags;
+	unsigned int idx;
+
+	spin_lock_irqsave(&tv_pw_lock, flags);
+	idx = (tv_pw_head + tv_pw_count) % TV_PENDING_MAX;
+	if (tv_pw_count < TV_PENDING_MAX) {
+		tv_pending_writes[idx].bdev = bdev;
+		tv_pending_writes[idx].sector = sector;
+		tv_pending_writes[idx].size = size;
+		tv_pw_count++;
+	}
+	spin_unlock_irqrestore(&tv_pw_lock, flags);
+}
+
+static void tv_pw_remove(struct block_device *bdev, sector_t sector,
+			 unsigned int size)
+{
+	unsigned long flags;
+	unsigned int i;
+
+	spin_lock_irqsave(&tv_pw_lock, flags);
+	for (i = 0; i < tv_pw_count; i++) {
+		unsigned int idx = (tv_pw_head + i) % TV_PENDING_MAX;
+		struct tv_pending_write *pw = &tv_pending_writes[idx];
+
+		if (pw->bdev == bdev && pw->sector == sector && pw->size == size) {
+			unsigned int j;
+
+			for (j = i; j + 1 < tv_pw_count; j++) {
+				unsigned int next = (tv_pw_head + j + 1) % TV_PENDING_MAX;
+
+				tv_pending_writes[(tv_pw_head + j) % TV_PENDING_MAX] =
+					tv_pending_writes[next];
+			}
+			tv_pw_count--;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&tv_pw_lock, flags);
+}
+
+static bool tv_pw_is_pending(struct block_device *bdev, sector_t sector,
+			     unsigned int size)
+{
+	unsigned long flags;
+	bool found = false;
+	unsigned int i;
+
+	spin_lock_irqsave(&tv_pw_lock, flags);
+	for (i = 0; i < tv_pw_count; i++) {
+		unsigned int idx = (tv_pw_head + i) % TV_PENDING_MAX;
+		struct tv_pending_write *pw = &tv_pending_writes[idx];
+
+		if (pw->bdev == bdev && pw->sector == sector && pw->size == size) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&tv_pw_lock, flags);
+	return found;
+}
+
 struct tv_retry_ctx {
-	struct work_struct work;
+	struct delayed_work dwork;
 	struct tieredvol_ctx *ctx;
 	sector_t sector;
 	unsigned int size;
@@ -245,8 +339,20 @@ struct tv_retry_ctx {
 
 static void tv_read_retry_work(struct work_struct *work)
 {
-	struct tv_retry_ctx *rc = container_of(work, struct tv_retry_ctx, work);
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct tv_retry_ctx *rc = container_of(dwork, struct tv_retry_ctx, dwork);
 	struct bio *clone;
+
+	/* 1b: If mirror write still in-flight, reschedule after 1ms */
+	if (tv_pw_is_pending(rc->ctx->devs[rc->mirror_disk]->bdev,
+			     rc->sector, rc->size)) {
+		tv_log(TV_LOG_INFO, rc->mirror_disk, TV_LOG_MIRROR,
+		       "retry delayed (mirror write pending) sec=%llu",
+		       (u64)rc->sector);
+		/* Reschedule with 1ms delay */
+		schedule_delayed_work(&rc->dwork, msecs_to_jiffies(1));
+		return;
+	}
 
 	clone = bio_alloc(rc->ctx->devs[rc->mirror_disk]->bdev,
 			  1, REQ_OP_READ, GFP_NOIO);
@@ -341,6 +447,10 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 				clone->bi_private = ctx;
 				clone->bi_end_io = tv_mirror_end_io;
 				ctx->mirror_write_bytes += bio->bi_iter.bi_size;
+				/* 1b: Track pending mirror write for ordering */
+				tv_pw_add(ctx->devs[seg->mirror_disk]->bdev,
+					  clone->bi_iter.bi_sector,
+					  bio->bi_iter.bi_size);
 				submit_bio(clone);
 				tv_log(TV_LOG_INFO, cur.disk, TV_LOG_MIRROR,
 				       "mirrored %uKB seg%d->disk%d",
@@ -412,14 +522,14 @@ static int tieredvol_end_io(struct dm_target *ti, struct bio *bio,
 					if (mirror >= 0 && mirror < ctx->ndisks) {
 						struct tv_retry_ctx *rc;
 
-						rc = kmalloc(sizeof(*rc), GFP_ATOMIC);
-						if (rc) {
-							INIT_WORK(&rc->work, tv_read_retry_work);
-							rc->ctx = ctx;
-							rc->sector = bio->bi_iter.bi_sector;
-							rc->size = bio->bi_iter.bi_size;
-							rc->mirror_disk = mirror;
-							schedule_work(&rc->work);
+					rc = kmalloc(sizeof(*rc), GFP_ATOMIC);
+					if (rc) {
+						INIT_DELAYED_WORK(&rc->dwork, tv_read_retry_work);
+						rc->ctx = ctx;
+						rc->sector = bio->bi_iter.bi_sector;
+						rc->size = bio->bi_iter.bi_size;
+						rc->mirror_disk = mirror;
+						schedule_delayed_work(&rc->dwork, 0);
 							tv_log(TV_LOG_INFO, i, TV_LOG_MIRROR,
 							       "scheduling read retry -> disk%d",
 							       mirror);
