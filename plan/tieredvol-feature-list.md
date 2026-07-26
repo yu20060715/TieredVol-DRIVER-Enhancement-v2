@@ -206,7 +206,9 @@
 
 ---
 
-## 10. 熱插拔 + 動態偵測（NSC 計畫新增目標）
+## 10. ~~熱插拔 + 動態偵測~~ **[ABANDONED]**
+
+> **Status:** 放棄。研究版本不需要此功能，複雜度過高（DM table reload + metadata 重建），ROI 不符合研究專案需求。
 
 | # | 功能 | 說明 | 參考專案 |
 |---|------|------|----------|
@@ -257,19 +259,20 @@
 
 ## 測試覆蓋率
 
-| 類別 | 功能數 | 有測試 |
-|------|:------:|:------:|
-| I/O dispatch | 6 | 6 |
-| Load balancing | 4 | 4 |
-| Stale detection | 4 | 4 |
-| Per-disk stats | 5 | 5 |
-| Per-CPU stats | 4 | 4 |
-| DM messages | 17 | 17 |
-| DM lifecycle | 7 | 7 |
-| Status | 3 | 3 |
-| Metadata | 3 | 3 |
-| Structured logging | 3 | 3 |
-| **Total** | **56** | **56** |
+| 類別 | 功能數 | 有測試 | 狀態 |
+|------|:------:|:------:|------|
+| I/O dispatch | 6 | 6 | ✅ |
+| Load balancing | 4 | 4 | ✅ |
+| Stale detection | 4 | 4 | ✅ |
+| Per-disk stats | 5 | 5 | ✅ |
+| Per-CPU stats | 4 | 4 | ✅ |
+| DM messages | 17 | 17 | ✅ |
+| DM lifecycle | 7 | 7 | ✅ |
+| Status | 3 | 3 | ✅ |
+| Metadata | 3 | 3 | ✅ |
+| Structured logging | 3 | 3 | ✅ |
+| **Total** | **56** | **56** | **All implemented** |
+| ~~熱插拔~~ | ~~4~~ | ~~0~~ | **ABANDONED** |
 
 ---
 

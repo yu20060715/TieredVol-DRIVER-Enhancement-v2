@@ -148,7 +148,7 @@ Production-ready upgrade plan. Each item includes open-source references for imp
 
 ---
 
-### 2d. Hot-plug Phase 1 (Online Add)
+### 2d. ~~Hot-plug Phase 1 (Online Add)~~ **[ABANDONED]**
 
 **Problem:** Cannot add disks at runtime. Must tear down and recreate volume.
 
@@ -156,13 +156,7 @@ Production-ready upgrade plan. Each item includes open-source references for imp
 
 **Effort:** 7-10 days
 
-**References:**
-1. `mdadm/Grow.c` — `Grow_Add_device()` for linear array hot-add
-   https://github.com/md-raid-utilities/mdadm/blob/main/Grow.c
-2. `drivers/md/dm.c` — `dev_create()` / `dev_remove()` dynamic device management
-   https://github.com/torvalds/linux/blob/master/drivers/md/dm.c
-3. `drivers/md/dm-table.c` — Table reload mechanism
-   https://github.com/torvalds/linux/blob/master/drivers/md/dm-table.c
+**Status:** 放棄。研究版本不需要此功能，複雜度過高（需 DM table reload + metadata 重建），ROI 不符合研究專案需求。
 
 ---
 
@@ -184,7 +178,7 @@ Production-ready upgrade plan. Each item includes open-source references for imp
 
 ---
 
-### 3b. Write Coalescing
+### 3b. ~~Write Coalescing~~ **[ABANDONED]**
 
 **Problem:** No bio merging for adjacent sequential writes. Small random writes not batched.
 
@@ -192,13 +186,7 @@ Production-ready upgrade plan. Each item includes open-source references for imp
 
 **Effort:** 5-7 days
 
-**References:**
-1. `block/blk-mq.c` — Bio plug/unplug for request merging
-   https://github.com/torvalds/linux/blob/master/block/blk-mq.c
-2. `drivers/md/dm-bufio.c` — Buffer cache with write batching
-   https://github.com/torvalds/linux/blob/master/drivers/md/dm-bufio.c
-3. `drivers/md/dm-writecache.c` — Write cache layer for dm targets
-   https://github.com/torvalds/linux/blob/master/drivers/md/dm-writecache.c
+**Status:** 放棄。研究版本不需要此功能，需大量改動 block layer（plug/unplug 或 writeback cache），風險過高且對研究目標無直接幫助。
 
 ---
 
@@ -271,11 +259,15 @@ Production-ready upgrade plan. Each item includes open-source references for imp
 
 | Phase | Items | Effort | Impact |
 |-------|:-----:|--------|--------|
-| Phase 1: Data Integrity | 5 | ~10 days | Data won't silently corrupt |
-| Phase 2: Availability | 4 | ~20 days | Disk failure → continue serving |
-| Phase 3: Performance | 3 | ~10 days | Better throughput |
-| Phase 4: Operational | 3 | ~7 days | Manageable |
-| **Total** | **15** | **~47 days** | **Production-ready prototype** |
+| Phase 1: Data Integrity | 5/5 done | ~10 days | Data won't silently corrupt |
+| Phase 2: Availability | 3/4 done, 1 abandoned (2d) | ~20 days | Disk failure → continue serving |
+| Phase 3: Performance | 2/3 done, 1 abandoned (3b) | ~10 days | Better throughput |
+| Phase 4: Operational | 3/3 done | ~7 days | Manageable |
+| **Total** | **13/15 done, 2 abandoned** | **~47 days** | **Production-ready prototype** |
+
+> **Abandoned items:**
+> - **2d Hot-plug** — 複雜度過高（DM table reload + metadata 重建），研究版本不需要
+> - **3b Write Coalescing** — 需大量改動 block layer，風險過高且對研究目標無直接幫助
 
 ---
 
@@ -289,16 +281,16 @@ Production-ready upgrade plan. Each item includes open-source references for imp
 | `drivers/md/dm-thin.c` | 2b, 4a | https://github.com/torvalds/linux/blob/master/drivers/md/dm-thin.c |
 | `drivers/md/dm-thin-metadata.c` | 1d, 1e | https://github.com/torvalds/linux/blob/master/drivers/md/dm-thin-metadata.c |
 | `drivers/md/dm-log.c` | 1b, 1d | https://github.com/torvalds/linux/blob/master/drivers/md/dm-log.c |
-| `drivers/md/dm.c` | 2a, 2c, 2d | https://github.com/torvalds/linux/blob/master/drivers/md/dm.c |
-| `drivers/md/dm-table.c` | 1a, 2d, 4a | https://github.com/torvalds/linux/blob/master/drivers/md/dm-table.c |
+| `drivers/md/dm.c` | 2a, 2c, ~~2d~~ | https://github.com/torvalds/linux/blob/master/drivers/md/dm.c |
+| `drivers/md/dm-table.c` | 1a, ~~2d~~, 4a | https://github.com/torvalds/linux/blob/master/drivers/md/dm-table.c |
 | `drivers/md/dm-integrity.c` | 1a | https://github.com/torvalds/linux/blob/master/drivers/md/dm-integrity.c |
-| `drivers/md/dm-bufio.c` | 1b, 3b | https://github.com/torvalds/linux/blob/master/drivers/md/dm-bufio.c |
-| `drivers/md/dm-writecache.c` | 3b | https://github.com/torvalds/linux/blob/master/drivers/md/dm-writecache.c |
+| `drivers/md/dm-bufio.c` | 1b, ~~3b~~ | https://github.com/torvalds/linux/blob/master/drivers/md/dm-bufio.c |
+| `drivers/md/dm-writecache.c` | ~~3b~~ | https://github.com/torvalds/linux/blob/master/drivers/md/dm-writecache.c |
 | `drivers/md/dm-btree.c` | 3a | https://github.com/torvalds/linux/blob/master/drivers/md/dm-btree.c |
 | `drivers/md/md.c` | 2b, 2c | https://github.com/torvalds/linux/blob/master/drivers/md/md.c |
 | `drivers/md/dm-mirror.c` | 1c | https://github.com/torvalds/linux/blob/master/drivers/md/dm-mirror.c |
 | `drivers/nvme/host/core.c` | 4a | https://github.com/torvalds/linux/blob/master/drivers/nvme/host/core.c |
-| `block/blk-mq.c` | 2a, 3b | https://github.com/torvalds/linux/blob/master/block/blk-mq.c |
+| `block/blk-mq.c` | 2a, ~~3b~~ | https://github.com/torvalds/linux/blob/master/block/blk-mq.c |
 | `fs/configfs/configfs.c` | 1d | https://github.com/torvalds/linux/blob/master/fs/configfs/configfs.c |
 | `lib/crc32.c` | 1e | https://github.com/torvalds/linux/blob/master/lib/crc32.c |
 | `lib/bsearch.c` | 3a | https://github.com/torvalds/linux/blob/master/lib/bsearch.c |
@@ -309,4 +301,4 @@ Production-ready upgrade plan. Each item includes open-source references for imp
 
 | Project | Features | URL |
 |---------|----------|-----|
-| mdadm | 2d | https://github.com/md-raid-utilities/mdadm |
+| mdadm | ~~2d~~ | https://github.com/md-raid-utilities/mdadm |

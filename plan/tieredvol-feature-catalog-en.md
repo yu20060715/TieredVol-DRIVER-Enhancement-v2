@@ -613,9 +613,9 @@ Kernel-space configuration file parser that loads the tieredvol topology from a 
 
 ---
 
-## 10. Hot-plug + Dynamic Detection (Future Work)
+## 10. ~~Hot-plug + Dynamic Detection~~ **[ABANDONED]**
 
-> **Status: Planned, not yet implemented.** These features are identified as core objectives but require significant engineering effort. The recommended approach uses DM table reload (dmsetup suspend/resume) for safe reconfiguration.
+> **Status: Abandoned.** Not needed for research version. Too complex (DM table reload + metadata rebuild), ROI does not meet research project requirements.
 
 ### #54 Online Add
 
@@ -780,4 +780,4 @@ A kernel-space ring buffer that records I/O, stale, mirror, and configuration ev
 | Structured Logging | 3 | 3 |
 | **Total** | **56** | **56** |
 
-> Note: 4 hot-plug features (#54-57) are planned but not yet implemented.
+> Note: 4 hot-plug features (#54-57) are abandoned. Not needed for research version, too complex.
