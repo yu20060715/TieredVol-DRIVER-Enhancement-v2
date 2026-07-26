@@ -445,7 +445,12 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 			clone = bio_alloc_clone(ctx->devs[seg->mirror_disk]->bdev,
 						bio, GFP_NOIO, &fs_bio_set);
 			if (clone) {
-				clone->bi_iter.bi_sector = cur.offset >> SECTOR_SHIFT;
+				/* Mirror stores contiguous copy from offset 0,
+				 * so use segment-relative offset, not
+				 * primary disk's striped physical offset.
+				 */
+				clone->bi_iter.bi_sector =
+					(logical - seg->logical_begin) >> SECTOR_SHIFT;
 				clone->bi_private = ctx;
 				clone->bi_end_io = tv_mirror_end_io;
 				ctx->mirror_write_bytes += bio->bi_iter.bi_size;
@@ -723,6 +728,7 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc,
 	return 0;
 
 free_error_count:
+	timer_delete_sync(&ctx->decay_timer);
 	kfree(ctx->error_count);
 put_devices:
 	for (i = i - 1; i >= 0; i--)
