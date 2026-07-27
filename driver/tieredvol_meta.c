@@ -91,23 +91,45 @@ static int parse_num_prefix(const char *s, unsigned long *idx,
 	return 0;
 }
 
-/* Compute CRC32C over file content, excluding lines containing "crc32=" */
-static u32 tv_compute_config_crc(const char *buf)
+/* Compute CRC32C over file content, excluding the "crc32=" line.
+ * Must match the kernel save path which computes crc32c(0, buf, off)
+ * over the entire content buffer atomically.
+ */
+static u32 tv_compute_config_crc(const char *buf, size_t len)
 {
-	const char *p = buf;
-	u32 crc = 0;
+	const char *crc_line;
+	size_t crc_len;
 
-	while (*p) {
-		const char *nl = strchr(p, '\n');
-		size_t len = nl ? (size_t)(nl - p + 1) : strlen(p);
+	/* Find the crc32= line and compute CRC over everything else */
+	crc_line = buf;
+	crc_len = 0;
 
-		/* Skip lines containing "crc32=" */
-		if (len < 7 || memcmp(p, "crc32=", 6) != 0)
-			crc = crc32c(crc, p, len);
+	/* Skip past the crc32= line */
+	{
+		const char *p = buf;
+		const char *end = buf + len;
+		size_t before_len = 0;
 
-		p = nl ? nl + 1 : p + len;
+		while (p < end) {
+			const char *nl = memchr(p, '\n', end - p);
+			size_t line_len = nl ? (size_t)(nl - p + 1) : (size_t)(end - p);
+
+			if (line_len >= 7 && memcmp(p, "crc32=", 6) == 0) {
+				/* CRC everything before this line */
+				crc_line = buf;
+				crc_len = before_len;
+				break;
+			}
+			before_len += line_len;
+			p = nl ? nl + 1 : end;
+			if (!nl)
+				break;
+		}
+		if (p >= end)
+			return 0; /* no crc32= line found */
 	}
-	return crc;
+
+	return crc32c(0, crc_line, crc_len);
 }
 
 int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
@@ -117,6 +139,7 @@ int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
 	loff_t pos = 0, file_size;
 	char *buf;
 	char *line, *next_line;
+	ssize_t bytes_read = 0;
 	int ret = 0;
 	u32 expected_crc = 0;
 	bool has_crc = false;
@@ -138,42 +161,56 @@ int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
 	}
 
 	{
-		ssize_t nr;
-
-		nr = kernel_read(f, buf, file_size, &pos);
+		bytes_read = kernel_read(f, buf, file_size, &pos);
 		filp_close(f, NULL);
 
-		if (nr < 0) {
+		if (bytes_read < 0) {
 			vfree(buf);
-			return (int)nr;
+			return (int)bytes_read;
 		}
-		if (nr == 0)
+		if (bytes_read == 0)
 			pr_warn("tieredvol: config file is empty\n");
-		buf[nr] = '\0';
+		buf[bytes_read] = '\0';
 	}
 
 	ret = 0;
 
 	memset(meta, 0, sizeof(*meta));
 
-	/* CRC32 pre-scan: find crc32= line before main parse loop */
+	/* CRC32 pre-scan: find crc32= line before main parse loop.
+	 * Must not destroy the buffer — do NOT use parse_line() which writes \0.
+	 */
 	{
 		char *scan;
 
 		for (scan = buf; scan && *scan; ) {
 			char *nl = strchr(scan, '\n');
-			char *k, *v;
-			char saved = nl ? *nl : '\0';
+			char *eq = strchr(scan, '=');
+			char saved_nl = nl ? *nl : '\0';
+			char saved_eq = '\0';
 
 			if (nl)
 				*nl = '\0';
-			if (parse_line(scan, &k, &v) == 0 &&
-			    strcmp(k, "crc32") == 0) {
-				if (kstrtou32(v, 10, &expected_crc) == 0)
-					has_crc = true;
+			if (eq) {
+				saved_eq = *eq;
+				*eq = '\0';
 			}
+
+			if (eq && strcmp(scan, "crc32") == 0) {
+				char *val = eq + 1;
+
+				if (nl)
+					*nl = '\0';
+				if (kstrtou32(val, 10, &expected_crc) == 0)
+					has_crc = true;
+				if (nl)
+					*nl = saved_nl;
+			}
+
+			if (eq)
+				*eq = saved_eq;
 			if (nl) {
-				*nl = saved;
+				*nl = saved_nl;
 				scan = nl + 1;
 			} else {
 				break;
@@ -183,7 +220,7 @@ int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
 
 	/* CRC32 validation — must be computed before parsing modifies buf */
 	if (has_crc) {
-		u32 actual_crc = tv_compute_config_crc(buf);
+		u32 actual_crc = tv_compute_config_crc(buf, bytes_read);
 
 		if (actual_crc != expected_crc) {
 			pr_err("tieredvol: config CRC mismatch (expected=0x%08x actual=0x%08x) — file may be corrupted\n",
