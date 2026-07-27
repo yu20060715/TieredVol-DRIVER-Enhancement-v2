@@ -141,6 +141,8 @@ score = ema_load[d] + ema_latency_ns[d] / 1000000 + wear_bias * total_write_byte
 
 遍歷候選碟，選最小 score 值。若所有候選碟均為 stale，則回退到任意有效碟。EMA 延遲項以微秒為單位（除以 1000000 轉換 ns→us），使延遲因子與載入因子在同一數量級。
 
+**Fallback 兩階段掃描：** 當所有候選碟的 score 都不理想（全部 stale/degraded）時，fallback 執行兩階段掃描：第一階段跳過 stale/degraded 碟，優先選非 stale 碟；若第一階段找不到（全部都是 stale/degraded），第二階段接受任何有效碟（包含 stale/degraded），確保 I/O 不會失敗。
+
 **核心 API：** `get_random_u32()`, 原子 EMA 更新（`tv_decay_timer_fn()`）
 
 **參考文獻：**
@@ -843,6 +845,10 @@ v5.0 引入 per-CPU pending 陣列實現無鎖鏡像追蹤，timestamp ring 實�
 > 每碟 256 條目的環形緩衝區，記錄 bio 提交時間戳，用於精確延遲測量。
 
 **實現方法：** `struct tv_ts_ring`（`tieredvol_mirror.c:161-165`），包含 `entries[256]`、`head`、`count`。`tv_ts_submit()`（:170-188）在 bio 提交時記錄 `ktime_get_boottime_ns()` 時間戳。`tv_ts_complete()`（:190-219）在 bio 完成時取出對應時間戳，計算延遲差並更新 `total_latency_ns[d]` 和 `total_completions[d]`。
+
+**溢出處理：** 當 ring 滿（count == 256）時，`tv_ts_submit()` 覆寫最舊 entry（advance head），不丟棄新 entry。確保高 IOPS 下 latency EMA 不會因丟失資料而失真。
+
+**鎖類型：** `tv_ts_lock_arr` 使用 `raw_spinlock_t`（非 `spinlock_t`），因為 `tv_ts_complete()` 在 bio end_io handler 中被呼叫，可能在 atomic context（不可睡眠）。
 
 **核心 API：** `ktime_get_boottime_ns()`
 

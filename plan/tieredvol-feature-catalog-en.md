@@ -141,6 +141,8 @@ score = ema_load[d] + ema_latency_ns[d] / 1000000 + wear_bias * total_write_byte
 
 Iterates candidate disks, selects minimum score. If all candidates are stale, falls back to any valid disk. The EMA latency term is in microseconds (divides ns by 1000000) to match the load factor's order of magnitude.
 
+**Fallback two-pass scan:** When all candidate disks have poor scores (all stale/degraded), the fallback performs a two-pass scan: first pass skips stale/degraded disks, preferring healthy ones; if first pass finds nothing (all disks stale/degraded), second pass accepts any valid disk (including stale/degraded), ensuring I/O does not fail.
+
 **Key APIs:** `get_random_u32()`, atomic EMA updates (`tv_decay_timer_fn()`)
 
 **References:**
@@ -843,6 +845,10 @@ v5.0 introduces per-CPU pending arrays for lockless mirror tracking, timestamp r
 > Per-disk 256-entry ring buffer recording bio submission timestamps for precise latency measurement.
 
 **Implementation:** `struct tv_ts_ring` (`tieredvol_mirror.c:161-165`), contains `entries[256]`, `head`, `count`. `tv_ts_submit()` (:170-188) records `ktime_get_boottime_ns()` timestamp at bio submission. `tv_ts_complete()` (:190-219) retrieves timestamp on completion, computes latency delta and updates `total_latency_ns[d]` and `total_completions[d]`.
+
+**Overflow handling:** When ring is full (count == 256), `tv_ts_submit()` overwrites the oldest entry (advances head) instead of dropping the new entry. Ensures latency EMA does not become stale due to data loss under high IOPS.
+
+**Lock type:** `tv_ts_lock_arr` uses `raw_spinlock_t` (not `spinlock_t`), because `tv_ts_complete()` is called from bio end_io handlers which may run in atomic context (non-sleepable).
 
 **Key APIs:** `ktime_get_boottime_ns()`
 

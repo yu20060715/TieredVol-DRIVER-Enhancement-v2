@@ -38,7 +38,8 @@
 ### #2 自适应多因子分派 `tv_map_logical_adaptive()`
 - 多因子评分选择最优碟，自动跳过 stale 碟
 - 评分 = ema_load + ema_latency_us + wear_penalty
-- 实现：`tieredvol_map.c:132-149`
+- Fallback 两阶段扫描：先跳过 stale/degraded，全部都是才接受任何碟
+- 实现：`tieredvol_map.c:132-161`
 - 内核参考：`kyber-iosched.c`, `mq-deadline.c`
 - 学术参考：Asymmetric RAID (HotStorage'24)
 
@@ -343,7 +344,9 @@
 
 ### #66 Timestamp Ring
 - 每碟 256 条目，精确延迟测量
-- 实现：`tieredvol_mirror.c:161-219`
+- 溢出时覆写最旧 entry（不丢弃），确保高 IOPS 下 EMA 不失真
+- 使用 raw_spinlock_t（end_io handler 在 atomic context）
+- 实现：`tieredvol_mirror.c:161-225`
 
 ### #67 Mempool
 - 零 OOM 镜像 bio 和重试上下文
