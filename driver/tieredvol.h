@@ -119,6 +119,7 @@ struct tieredvol_ctx {
 	struct tv_adaptive_state adaptive;
 	struct tv_mirror_stats mirror;
 	struct tv_rebuild_state rebuild;
+	bool mirror_enabled_any;
 	struct work_struct trigger_event;
 };
 

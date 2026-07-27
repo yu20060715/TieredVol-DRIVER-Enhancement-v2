@@ -270,6 +270,19 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		}
 	}
 
+	/* Check if any segment has mirror enabled */
+	{
+		u32 si;
+
+		ctx->mirror_enabled_any = false;
+		for (si = 0; si < ctx->meta.segment_count; si++) {
+			if (ctx->meta.segments[si].mirror_enabled) {
+				ctx->mirror_enabled_any = true;
+				break;
+			}
+		}
+	}
+
 	/* Compute min_chunk_sectors and stripe_sectors */
 	{
 		sector_t global_min_chunk = (sector_t)-1;

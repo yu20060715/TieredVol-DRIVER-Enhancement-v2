@@ -260,75 +260,86 @@ fail:
 int tieredvol_end_io(struct dm_target *ti, struct bio *bio, blk_status_t *error)
 {
 	struct tieredvol_ctx *ctx = ti->private;
+	int i, disk_id = -1;
 
-	if (bio->bi_status != BLK_STS_OK) {
-		int i;
-
-		for (i = 0; i < ctx->ndisks; i++) {
-			if (bio->bi_bdev != ctx->devs[i]->bdev)
-				continue;
-
-			{
-				int errs;
-
-				errs = atomic_inc_return(&ctx->deg.error_count[i]);
-				tv_log(TV_LOG_ERR, i, TV_LOG_IO,
-				       "I/O error on %s status=%d err=%d",
-				       ctx->meta.disk_names[i],
-				       bio->bi_status, errs);
-
-				if (!ctx->deg.degraded[i] &&
-				    errs >= (int)ctx->deg.error_threshold) {
-					ctx->deg.degraded[i] = true;
-					pr_warn("tieredvol: disk[%d] %s DEGRADED (errors=%d >= threshold=%u)\n",
-						i, ctx->meta.disk_names[i],
-						errs,
-						ctx->deg.error_threshold);
-					tv_log(TV_LOG_WARN, i, TV_LOG_IO,
-					       "DEGRADED err=%d", errs);
-					schedule_work(&ctx->trigger_event);
-				}
-			}
-
-			if (bio_data_dir(bio) == READ) {
-				int mirror;
-				sector_t mirror_sector;
-
-				mirror = tv_pending_find_and_remove(
-					bio->bi_bdev,
-					bio->bi_iter.bi_sector,
-					bio->bi_iter.bi_size,
-					&mirror_sector);
-
-				if (mirror >= 0 &&
-				    mirror < ctx->ndisks) {
-					struct tv_retry_ctx *rc;
-
-					rc = kmalloc(sizeof(*rc),
-						     GFP_ATOMIC);
-					if (rc) {
-						INIT_DELAYED_WORK(
-							&rc->dwork,
-							tv_read_retry_work);
-						rc->ctx = ctx;
-						rc->orig_bio = bio;
-						rc->sector = mirror_sector;
-						rc->size =
-							bio->bi_iter.bi_size;
-						rc->mirror_disk =
-							mirror;
-						rc->retries = 32;
-						bio_get(bio);
-						schedule_delayed_work(
-							&rc->dwork, 0);
-						return 1;
-					}
-				}
-			}
-
+	/* Single scan: find which disk this bio completed on */
+	for (i = 0; i < ctx->ndisks; i++) {
+		if (bio->bi_bdev == ctx->devs[i]->bdev) {
+			disk_id = i;
 			break;
 		}
-	} else if (bio_data_dir(bio) == READ) {
+	}
+
+	/* Fix 2: Decrement in_flight_bytes on every completion */
+	if (disk_id >= 0)
+		atomic_sub(bio->bi_iter.bi_size,
+			   &ctx->io.in_flight_bytes[disk_id]);
+
+	/* Error path */
+	if (bio->bi_status != BLK_STS_OK) {
+		if (disk_id >= 0) {
+			int errs;
+
+			errs = atomic_inc_return(&ctx->deg.error_count[disk_id]);
+			tv_log(TV_LOG_ERR, disk_id, TV_LOG_IO,
+			       "I/O error on %s status=%d err=%d",
+			       ctx->meta.disk_names[disk_id],
+			       bio->bi_status, errs);
+
+			if (!ctx->deg.degraded[disk_id] &&
+			    errs >= (int)ctx->deg.error_threshold) {
+				ctx->deg.degraded[disk_id] = true;
+				pr_warn("tieredvol: disk[%d] %s DEGRADED (errors=%d >= threshold=%u)\n",
+					disk_id, ctx->meta.disk_names[disk_id],
+					errs,
+					ctx->deg.error_threshold);
+				tv_log(TV_LOG_WARN, disk_id, TV_LOG_IO,
+				       "DEGRADED err=%d", errs);
+				schedule_work(&ctx->trigger_event);
+			}
+		}
+
+		if (bio_data_dir(bio) == READ && disk_id >= 0) {
+			int mirror;
+			sector_t mirror_sector;
+
+			mirror = tv_pending_find_and_remove(
+				bio->bi_bdev,
+				bio->bi_iter.bi_sector,
+				bio->bi_iter.bi_size,
+				&mirror_sector);
+
+			if (mirror >= 0 &&
+			    mirror < ctx->ndisks) {
+				struct tv_retry_ctx *rc;
+
+				rc = kmalloc(sizeof(*rc),
+					     GFP_ATOMIC);
+				if (rc) {
+					INIT_DELAYED_WORK(
+						&rc->dwork,
+						tv_read_retry_work);
+					rc->ctx = ctx;
+					rc->orig_bio = bio;
+					rc->sector = mirror_sector;
+					rc->size =
+						bio->bi_iter.bi_size;
+					rc->mirror_disk =
+						mirror;
+					rc->retries = 32;
+					bio_get(bio);
+					schedule_delayed_work(
+						&rc->dwork, 0);
+					return 1;
+				}
+			}
+		}
+
+		return 0;
+	}
+
+	/* Success path: only scan pending if mirror is configured */
+	if (bio_data_dir(bio) == READ && ctx->mirror_enabled_any) {
 		tv_pending_find_and_remove(bio->bi_bdev,
 					   bio->bi_iter.bi_sector,
 					   bio->bi_iter.bi_size,
