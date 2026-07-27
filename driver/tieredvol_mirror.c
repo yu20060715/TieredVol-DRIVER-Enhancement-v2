@@ -152,6 +152,12 @@ static bool tv_pw_is_pending(struct block_device *bdev, sector_t sector,
 
 /* ---- Timestamp ring for latency tracking (global, lightweight) ---- */
 
+struct tv_ts_entry {
+	sector_t sector;
+	unsigned int size;
+	ktime_t submit_ns;
+};
+
 struct tv_ts_ring {
 	struct tv_ts_entry entries[256];
 	unsigned int head;

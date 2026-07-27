@@ -15,10 +15,7 @@
 /* Aliases: canonical constants live in tieredvol_meta_format.h */
 #define TV_MAX_DISKS    TV_META_MAX_DISKS
 #define TV_MAX_SEGS     TV_META_MAX_SEGS
-#define TV_MAX_WEIGHT   TV_META_MAX_WEIGHT
-#define TV_CHUNK_SIZE   TV_META_CHUNK_SIZE
 #define TV_SECTOR_SHIFT 9
-#define TV_SECTOR_SIZE  (1 << TV_SECTOR_SHIFT)
 
 struct tieredvol_segment {
 	u64 logical_begin;
@@ -80,14 +77,12 @@ struct tv_adaptive_state {
 	u64 stale_marked_ns[TV_MAX_DISKS];
 	u64 grace_until_ns[TV_MAX_DISKS];
 	u64 last_finish_ns[TV_MAX_DISKS];
-	u64 last_interval_bytes[TV_MAX_DISKS];
 	struct timer_list decay_timer;
 	u32 wear_bias;
 	enum tv_policy policy;
 	/* Adaptive v2: multi-factor scoring */
 	u64 ema_latency_ns[TV_MAX_DISKS];
 	u64 ema_iops[TV_MAX_DISKS];
-	u32 write_boost;
 };
 
 struct tv_mirror_stats {
@@ -156,10 +151,6 @@ int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
 
 /* ---- tieredvol_log.c exports ---- */
 void tv_log(u8 level, u8 disk_idx, u8 event_type, const char *fmt, ...);
-u64 tv_read_count(void);
-u64 tv_read_sectors(void);
-u64 tv_read_bytes(void);
-void tv_reset_stats(void);
 
 #define TV_LOG_SIZE 512
 
@@ -217,19 +208,6 @@ struct tv_pending_write_entry {
 
 struct tv_pending_write_cpu {
 	struct tv_pending_write_entry entries[64];
-	unsigned int head;
-	unsigned int count;
-};
-
-/* ---- Per-CPU timestamp ring for latency tracking ---- */
-struct tv_ts_entry {
-	sector_t sector;
-	unsigned int size;
-	ktime_t submit_ns;
-};
-
-struct tv_ts_ring_cpu {
-	struct tv_ts_entry entries[128];
 	unsigned int head;
 	unsigned int count;
 };

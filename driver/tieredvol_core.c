@@ -247,9 +247,6 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	atomic_set(&ctx->rebuild.running, 0);
 	init_completion(&ctx->rebuild.done_r);
 	init_completion(&ctx->rebuild.done_w);
-	/* Adaptive v2: initialize multi-factor fields */
-	ctx->adaptive.write_boost = 0;
-
 	timer_setup(&ctx->adaptive.decay_timer, tv_decay_timer_fn, 0);
 	mod_timer(&ctx->adaptive.decay_timer, jiffies + HZ);
 

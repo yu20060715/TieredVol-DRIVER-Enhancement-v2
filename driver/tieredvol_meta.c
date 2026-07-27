@@ -156,6 +156,31 @@ int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
 
 	memset(meta, 0, sizeof(*meta));
 
+	/* CRC32 pre-scan: find crc32= line before main parse loop */
+	{
+		char *scan;
+
+		for (scan = buf; scan && *scan; ) {
+			char *nl = strchr(scan, '\n');
+			char *k, *v;
+			char saved = nl ? *nl : '\0';
+
+			if (nl)
+				*nl = '\0';
+			if (parse_line(scan, &k, &v) == 0 &&
+			    strcmp(k, "crc32") == 0) {
+				if (kstrtou32(v, 10, &expected_crc) == 0)
+					has_crc = true;
+			}
+			if (nl) {
+				*nl = saved;
+				scan = nl + 1;
+			} else {
+				break;
+			}
+		}
+	}
+
 	/* CRC32 validation — must be computed before parsing modifies buf */
 	if (has_crc) {
 		u32 actual_crc = tv_compute_config_crc(buf);

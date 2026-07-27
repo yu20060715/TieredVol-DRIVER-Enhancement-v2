@@ -145,7 +145,18 @@ static int tv_metadata_save_kernel(struct tieredvol_ctx *ctx)
 static int msg_reset_stats(struct dm_target *ti, unsigned int argc,
 			   char **argv, char *result, unsigned int maxlen)
 {
-	tv_reset_stats();
+	struct tieredvol_ctx *ctx = ti->private;
+	int i;
+
+	for (i = 0; i < ctx->ndisks; i++) {
+		atomic64_set(&ctx->io.total_read_bytes[i], 0);
+		atomic64_set(&ctx->io.total_write_bytes[i], 0);
+		atomic64_set(&ctx->io.total_read_ops[i], 0);
+		atomic64_set(&ctx->io.total_write_ops[i], 0);
+		atomic64_set(&ctx->io.total_latency_ns[i], 0);
+		atomic64_set(&ctx->io.total_completions[i], 0);
+		atomic64_set(&ctx->io.interval_completions[i], 0);
+	}
 	snprintf(result, maxlen, "stats reset");
 	return 0;
 }
@@ -153,13 +164,20 @@ static int msg_reset_stats(struct dm_target *ti, unsigned int argc,
 static int msg_show_stats(struct dm_target *ti, unsigned int argc,
 			  char **argv, char *result, unsigned int maxlen)
 {
-	u64 cnt = tv_read_count();
-	u64 bytes = tv_read_bytes();
-	u64 avg = cnt ? bytes / cnt : 0;
+	struct tieredvol_ctx *ctx = ti->private;
+	int i, off = 0;
 
-	pr_info("tieredvol: maps=%llu avg_bytes=%llu total_bytes=%llu",
-		cnt, avg, bytes);
-	snprintf(result, maxlen, "maps=%llu avg_bytes=%llu", cnt, avg);
+	for (i = 0; i < ctx->ndisks && off < (int)maxlen - 2; i++) {
+		off += snprintf(result + off, maxlen - off,
+				"%s:rd=%llu/%llu wr=%llu/%llu",
+				ctx->meta.disk_names[i],
+				atomic64_read(&ctx->io.total_read_ops[i]),
+				atomic64_read(&ctx->io.total_read_bytes[i]),
+				atomic64_read(&ctx->io.total_write_ops[i]),
+				atomic64_read(&ctx->io.total_write_bytes[i]));
+		if (i + 1 < ctx->ndisks && off < (int)maxlen - 1)
+			result[off++] = ' ';
+	}
 	return 0;
 }
 
@@ -297,9 +315,10 @@ static int msg_show_adaptive(struct dm_target *ti, unsigned int argc,
 			ctx->adaptive.wear_bias);
 	for (i = 0; i < ctx->ndisks && off < (int)maxlen - 1; i++) {
 		off += snprintf(result + off, maxlen - off,
-				" %s:load=%llu writes=%llu stale=%d",
+				" %s:load=%llu lat=%lluus writes=%llu stale=%d",
 				ctx->meta.disk_names[i],
 				ctx->adaptive.ema_load[i],
+				ctx->adaptive.ema_latency_ns[i] / 1000ULL,
 				atomic64_read(&ctx->io.total_write_bytes[i]),
 				ctx->adaptive.stale[i]);
 	}
@@ -473,7 +492,9 @@ static int msg_show_log(struct dm_target *ti, unsigned int argc,
 	raw_spin_unlock_irqrestore(&tv_log_lock, flags);
 
 	for (i = 0; i < cnt; i++)
-		pr_info("tieredvol: LOG %s %s: %s\n",
+		pr_info("tieredvol: LOG [%lld.%06lld] %s %s: %s\n",
+			entries[i].timestamp_ns / 1000000000ULL,
+			(entries[i].timestamp_ns / 1000ULL) % 1000000ULL,
 			entries[i].level == TV_LOG_ERR ? "ERR" :
 			entries[i].level == TV_LOG_WARN ? "WRN" : "INF",
 			entries[i].event_type == TV_LOG_STALE ? "STALE" :

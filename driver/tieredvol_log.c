@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * tieredvol_log.c — Log ring buffer, EMA load tracking, per-CPU counters
+ * tieredvol_log.c — Log ring buffer, EMA load tracking
  *
  * Extracted from tieredvol_core.c in Phase 1 refactoring.
  */
 #include <linux/module.h>
 #include <linux/moduleparam.h>
-#include <linux/percpu.h>
 #include <linux/spinlock.h>
 #include <linux/kfifo.h>
 #include <linux/stdarg.h>
@@ -15,54 +14,6 @@
 #include <linux/timer.h>
 #include <linux/sprintf.h>
 #include "tieredvol.h"
-
-/* ---- Per-CPU map counters ---- */
-
-static DEFINE_PER_CPU(u64, tv_map_count);
-static DEFINE_PER_CPU(u64, tv_map_sectors);
-static DEFINE_PER_CPU(u64, tv_map_bytes);
-
-u64 tv_read_count(void)
-{
-	u64 total = 0;
-	int cpu;
-
-	for_each_possible_cpu(cpu)
-		total += per_cpu(tv_map_count, cpu);
-	return total;
-}
-
-u64 tv_read_sectors(void)
-{
-	u64 total = 0;
-	int cpu;
-
-	for_each_possible_cpu(cpu)
-		total += per_cpu(tv_map_sectors, cpu);
-	return total;
-}
-
-u64 tv_read_bytes(void)
-{
-	u64 total = 0;
-	int cpu;
-
-	for_each_possible_cpu(cpu)
-		total += per_cpu(tv_map_bytes, cpu);
-	return total;
-}
-
-void tv_reset_stats(void)
-{
-	int cpu;
-
-	for_each_possible_cpu(cpu) {
-		per_cpu(tv_map_count, cpu) = 0;
-		per_cpu(tv_map_sectors, cpu) = 0;
-		per_cpu(tv_map_bytes, cpu) = 0;
-	}
-}
-EXPORT_SYMBOL_GPL(tv_reset_stats);
 
 /* ---- Log ring buffer ---- */
 
@@ -149,8 +100,6 @@ void tv_decay_timer_fn(struct timer_list *timer)
 				(ctx->adaptive.ema_latency_ns[i] * one_minus_alpha +
 				 avg_latency * alpha) >> 10;
 		}
-
-		ctx->adaptive.last_interval_bytes[i] = snapshot;
 
 		if (ctx->adaptive.stale_after_ns > 0 && snapshot > 0)
 			ctx->adaptive.last_finish_ns[i] = now;
