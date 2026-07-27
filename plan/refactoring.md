@@ -338,7 +338,7 @@ struct tv_msg_handler {
 
 **驗證:** `make clean && make test`
 **風險:** 低
-**狀態:** [ ] 待執行
+**狀態:** [x] 完成 (81/81 unit tests pass)
 
 ---
 

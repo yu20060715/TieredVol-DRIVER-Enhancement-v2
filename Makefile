@@ -49,23 +49,23 @@ src/cmd_scheduler.o: src/cmd_scheduler.c src/cmd_scheduler.h src/cmd_create.h sr
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Unit tests (no io_uring dependency — pure logic)
-test_common: tests/test_common.c src/tieredvol_common.h
+tests/test_common: tests/test_common.c src/tieredvol_common.h
 	$(CC) $(CFLAGS) -o $@ $<
 
-test_mapper: tests/test_mapper.c src/tieredvol_types.h $(SCHED_OBJS)
+tests/test_mapper: tests/test_mapper.c src/tieredvol_types.h $(SCHED_OBJS)
 	$(CC) $(CFLAGS) -o $@ $< $(SCHED_OBJS)
 
-test_partition: tests/test_partition.c src/tieredvol_types.h $(SCHED_OBJS)
+tests/test_partition: tests/test_partition.c src/tieredvol_types.h $(SCHED_OBJS)
 	$(CC) $(CFLAGS) -o $@ $< $(SCHED_OBJS)
 
-test_metadata: tests/test_metadata.c src/tieredvol_types.h $(SCHED_OBJS)
+tests/test_metadata: tests/test_metadata.c src/tieredvol_types.h $(SCHED_OBJS)
 	$(CC) $(CFLAGS) -o $@ $< $(SCHED_OBJS)
 
-test: test_common test_mapper test_partition test_metadata
-	@echo "=== test_common ===" && ./test_common && \
-	echo "=== test_mapper ===" && ./test_mapper && \
-	echo "=== test_partition ===" && ./test_partition && \
-	echo "=== test_metadata ===" && ./test_metadata
+test: tests/test_common tests/test_mapper tests/test_partition tests/test_metadata
+	@echo "=== test_common ===" && ./tests/test_common && \
+	echo "=== test_mapper ===" && ./tests/test_mapper && \
+	echo "=== test_partition ===" && ./tests/test_partition && \
+	echo "=== test_metadata ===" && ./tests/test_metadata
 
 test-full: test
 	@echo "=== Integration tests (DM messages) ==="
@@ -96,7 +96,7 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/tiered_setup
 
 clean:
-	rm -f tiered_setup test_common test_mapper test_partition test_metadata
+	rm -f tiered_setup tests/test_common tests/test_mapper tests/test_partition tests/test_metadata
 	rm -f src/*.o
 
 .PHONY: all install uninstall clean test test-full module module_install module_clean

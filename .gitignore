@@ -1,9 +1,9 @@
 # Build artifacts (userspace)
 tiered_setup
-test_common
-test_mapper
-test_partition
-test_metadata
+tests/test_common
+tests/test_mapper
+tests/test_partition
+tests/test_metadata
 src/*.o
 *.pyc
 
