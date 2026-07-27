@@ -424,6 +424,22 @@ static int msg_set_mirror(struct dm_target *ti, unsigned int argc,
 	    seg_idx >= ctx->meta.segment_count ||
 	    disk_idx >= (u32)ctx->ndisks)
 		return -EINVAL;
+
+	/* Mirror target must not be a stripe participant */
+	{
+		struct tieredvol_segment *seg =
+			&ctx->meta.segments[seg_idx];
+		unsigned int k;
+
+		for (k = 0; k < seg->disk_count; k++) {
+			if (seg->disk_index[k] == disk_idx) {
+				pr_err("tieredvol: mirror disk %u is stripe participant of seg%u\n",
+				       disk_idx, seg_idx);
+				return -EINVAL;
+			}
+		}
+	}
+
 	ctx->meta.segments[seg_idx].mirror_enabled = true;
 	ctx->meta.segments[seg_idx].mirror_disk = disk_idx;
 	pr_info("tieredvol: seg%u mirror -> disk%u (%s)\n", seg_idx,

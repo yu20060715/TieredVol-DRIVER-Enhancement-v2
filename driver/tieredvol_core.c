@@ -91,31 +91,48 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 		    seg->mirror_disk < (u32)ctx->ndisks &&
 		    seg->mirror_disk != (u32)cur.disk) {
 			struct bio *clone;
+			struct tv_mirror_pw_ctx *pwc;
+			sector_t mirror_sec =
+				(logical - seg->logical_begin) >>
+				TV_SECTOR_SHIFT;
+			unsigned int bio_sz = bio->bi_iter.bi_size;
+
+			pwc = kmalloc(sizeof(*pwc), GFP_NOIO);
+			if (!pwc) {
+				atomic64_inc(&ctx->mirror.mirror_errors);
+				tv_log(TV_LOG_ERR, cur.disk, TV_LOG_MIRROR,
+				       "mirror pwc alloc fail seg%d", cur.seg_idx);
+				goto mirror_done;
+			}
 
 			clone = bio_alloc_clone(
 				ctx->devs[seg->mirror_disk]->bdev, bio,
 				GFP_NOIO, &fs_bio_set);
-			if (clone) {
-				clone->bi_iter.bi_sector =
-					(logical - seg->logical_begin) >>
-					TV_SECTOR_SHIFT;
-				clone->bi_private = ctx;
-				clone->bi_end_io = tv_mirror_end_io;
-			atomic64_add(bio->bi_iter.bi_size,
-				     &ctx->mirror.mirror_write_bytes);
-				tv_pw_add(ctx->devs[seg->mirror_disk]->bdev,
-					  clone->bi_iter.bi_sector,
-					  bio->bi_iter.bi_size);
-				submit_bio(clone);
-				tv_log(TV_LOG_INFO, cur.disk, TV_LOG_MIRROR,
-				       "mirrored %uKB seg%d->disk%d",
-				       bio->bi_iter.bi_size >> 10,
-				       cur.seg_idx, seg->mirror_disk);
-			} else {
+			if (!clone) {
+				kfree(pwc);
 				atomic64_inc(&ctx->mirror.mirror_errors);
 				tv_log(TV_LOG_ERR, cur.disk, TV_LOG_MIRROR,
 				       "mirror alloc fail seg%d", cur.seg_idx);
+				goto mirror_done;
 			}
+
+			clone->bi_iter.bi_sector = mirror_sec;
+			pwc->ctx = ctx;
+			pwc->bdev = ctx->devs[seg->mirror_disk]->bdev;
+			pwc->sector = mirror_sec;
+			pwc->size = bio_sz;
+			clone->bi_private = pwc;
+			clone->bi_end_io = tv_mirror_end_io;
+			atomic64_add(bio_sz,
+				     &ctx->mirror.mirror_write_bytes);
+			tv_pw_add(ctx->devs[seg->mirror_disk]->bdev,
+				  mirror_sec, bio_sz);
+			submit_bio(clone);
+			tv_log(TV_LOG_INFO, cur.disk, TV_LOG_MIRROR,
+			       "mirrored %uKB seg%d->disk%d",
+			       bio_sz >> 10,
+			       cur.seg_idx, seg->mirror_disk);
+mirror_done:
 		}
 	}
 
@@ -129,10 +146,14 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 		if (seg->mirror_enabled &&
 		    seg->mirror_disk < (u32)ctx->ndisks &&
 		    seg->mirror_disk != (u32)cur.disk) {
+			sector_t mirror_sec =
+				(logical - seg->logical_begin) >>
+				TV_SECTOR_SHIFT;
 			tv_pending_add(ctx->devs[cur.disk]->bdev,
 				       bio->bi_iter.bi_sector,
 				       bio->bi_iter.bi_size,
-				       (int)seg->mirror_disk);
+				       (int)seg->mirror_disk,
+				       mirror_sec);
 		}
 	}
 

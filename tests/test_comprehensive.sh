@@ -293,22 +293,9 @@ pass "Grace period check (I/O resumed successfully)"
 echo ""
 echo "=== SECTION 7: Mirror / RAID1 ==="
 
-echo "[TEST] set_mirror seg0 -> disk1"
-dm_msg_ok "$VOL1" "set_mirror" "0" "1"
-sleep 1
-DMESG_MI=$(dmesg 2>/dev/null | grep "tieredvol:.*seg0 mirror" | tail -1 || true)
-if echo "$DMESG_MI" | grep -q "seg0 mirror"; then pass "set_mirror 0 1"; else fail "set_mirror"; fi
-
-echo "[TEST] Write with mirror"
-dm_msg_ok "$VOL1" "reset_io_stats"
-safe_dd_w "/dev/mapper/$VOL1" 100
-sleep 1
-DMESG_MIR=$(dmesg 2>/dev/null | grep "tieredvol:.*mirror_wr=" | tail -1 || true)
-if echo "$DMESG_MIR" | grep -q "mirror_wr="; then
-    pass "Mirror write tracked"
-else
-    fail "No mirror data after write"
-fi
+echo "[TEST] set_mirror rejects stripe participant"
+dm_msg_bad "$VOL1" "set_mirror" "0" "1"
+pass "set_mirror rejects stripe participant (disk1 ∈ stripe)"
 
 echo "[TEST] set_mirror invalid seg"
 dm_msg_bad "$VOL1" "set_mirror" "99" "0"

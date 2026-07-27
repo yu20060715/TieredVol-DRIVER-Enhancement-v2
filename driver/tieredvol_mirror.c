@@ -20,11 +20,12 @@
 struct tv_pending_read {
 	struct block_device *bdev;
 	sector_t sector;
+	sector_t mirror_sector;
 	unsigned int size;
 	int mirror_disk;
 };
 
-#define TV_PENDING_MAX 64
+#define TV_PENDING_MAX 1024
 
 static struct tv_pending_read tv_pending_reads[TV_PENDING_MAX];
 static unsigned int tv_pending_head;
@@ -32,7 +33,8 @@ static unsigned int tv_pending_count;
 static DEFINE_SPINLOCK(tv_pending_lock);
 
 void tv_pending_add(struct block_device *bdev, sector_t sector,
-		    unsigned int size, int mirror_disk)
+		    unsigned int size, int mirror_disk,
+		    sector_t mirror_sector)
 {
 	unsigned long flags;
 	unsigned int idx;
@@ -42,6 +44,7 @@ void tv_pending_add(struct block_device *bdev, sector_t sector,
 	if (tv_pending_count < TV_PENDING_MAX) {
 		tv_pending_reads[idx].bdev = bdev;
 		tv_pending_reads[idx].sector = sector;
+		tv_pending_reads[idx].mirror_sector = mirror_sector;
 		tv_pending_reads[idx].size = size;
 		tv_pending_reads[idx].mirror_disk = mirror_disk;
 		tv_pending_count++;
@@ -53,7 +56,7 @@ void tv_pending_add(struct block_device *bdev, sector_t sector,
 EXPORT_SYMBOL_GPL(tv_pending_add);
 
 int tv_pending_find_and_remove(struct block_device *bdev, sector_t sector,
-			       unsigned int size)
+			       unsigned int size, sector_t *mirror_sector_out)
 {
 	unsigned long flags;
 	int mirror_disk = -1;
@@ -69,6 +72,8 @@ int tv_pending_find_and_remove(struct block_device *bdev, sector_t sector,
 			unsigned int j;
 
 			mirror_disk = pr->mirror_disk;
+			if (mirror_sector_out)
+				*mirror_sector_out = pr->mirror_sector;
 			for (j = i; j + 1 < tv_pending_count; j++) {
 				unsigned int next =
 					(tv_pending_head + j + 1) %
@@ -175,34 +180,38 @@ static bool tv_pw_is_pending(struct block_device *bdev, sector_t sector,
 
 void tv_mirror_end_io(struct bio *bio)
 {
-	struct tieredvol_ctx *bio_ctx = bio->bi_private;
+	struct tv_mirror_pw_ctx *pwc = bio->bi_private;
 
 	if (bio->bi_status != BLK_STS_OK)
-		atomic64_inc(&bio_ctx->mirror.mirror_errors);
+		atomic64_inc(&pwc->ctx->mirror.mirror_errors);
 	else
-		atomic64_inc(&bio_ctx->mirror.mirror_write_ops);
+		atomic64_inc(&pwc->ctx->mirror.mirror_write_ops);
 
-	tv_pw_remove(bio->bi_bdev, bio->bi_iter.bi_sector, bio->bi_iter.bi_size);
-
+	tv_pw_remove(pwc->bdev, pwc->sector, pwc->size);
+	kfree(pwc);
 	bio_put(bio);
 }
 EXPORT_SYMBOL_GPL(tv_mirror_end_io);
 
-/* ---- Read-only mirror completion (for retries) ---- */
+/* ---- Mirror retry completion (reads from mirror, completes orig bio) ---- */
 
-static void tv_mirror_read_end_io(struct bio *bio)
+static void tv_mirror_retry_end_io(struct bio *bio)
 {
-	struct tieredvol_ctx *bio_ctx = bio->bi_private;
+	struct tv_retry_ctx *rc = bio->bi_private;
+	struct bio *orig_bio = rc->orig_bio;
 
-	if (bio->bi_status != BLK_STS_OK)
-		atomic64_inc(&bio_ctx->mirror.mirror_errors);
-	else
-		atomic64_inc(&bio_ctx->mirror.mirror_read_ops);
+	if (bio->bi_status == BLK_STS_OK) {
+		orig_bio->bi_status = BLK_STS_OK;
+		atomic64_inc(&rc->ctx->mirror.mirror_read_ops);
+	} else {
+		orig_bio->bi_status = bio->bi_status;
+		atomic64_inc(&rc->ctx->mirror.mirror_errors);
+	}
 
-	tv_pw_remove(bio->bi_bdev, bio->bi_iter.bi_sector,
-		     bio->bi_iter.bi_size);
-
+	bio_endio(orig_bio);
+	bio_put(orig_bio);
 	bio_put(bio);
+	kfree(rc);
 }
 
 /* ---- Read retry work ---- */
@@ -217,37 +226,32 @@ static void tv_read_retry_work(struct work_struct *work)
 	if (tv_pw_is_pending(rc->ctx->devs[rc->mirror_disk]->bdev,
 			     rc->sector, rc->size)) {
 		if (rc->retries-- > 0) {
-			tv_log(TV_LOG_INFO, rc->mirror_disk, TV_LOG_MIRROR,
-			       "retry delayed (pending) sec=%llu retries=%d",
-			       (u64)rc->sector, rc->retries);
 			schedule_delayed_work(&rc->dwork, msecs_to_jiffies(1));
 			return;
 		}
-		tv_log(TV_LOG_WARN, rc->mirror_disk, TV_LOG_MIRROR,
-		       "retry giving up (pending too long) sec=%llu",
-		       (u64)rc->sector);
-		goto out;
+		pr_warn("tieredvol: mirror retry gave up after 32 retries\n");
+		goto fail;
 	}
 
-	clone = bio_alloc(rc->ctx->devs[rc->mirror_disk]->bdev, 1,
-			  REQ_OP_READ, GFP_NOIO);
+	clone = bio_alloc_clone(rc->ctx->devs[rc->mirror_disk]->bdev,
+				rc->orig_bio, GFP_NOIO, &fs_bio_set);
 	if (!clone) {
-		tv_log(TV_LOG_ERR, rc->mirror_disk, TV_LOG_MIRROR,
-		       "retry alloc failed sec=%llu", (u64)rc->sector);
-		goto out;
+		pr_err("tieredvol: mirror retry clone alloc failed\n");
+		goto fail;
 	}
 
 	clone->bi_iter.bi_sector = rc->sector;
 	clone->bi_iter.bi_size = rc->size;
-	clone->bi_end_io = tv_mirror_read_end_io;
-	clone->bi_private = rc->ctx;
+	clone->bi_end_io = tv_mirror_retry_end_io;
+	clone->bi_private = rc;
 
 	submit_bio(clone);
-	tv_log(TV_LOG_INFO, rc->mirror_disk, TV_LOG_MIRROR,
-	       "retry read -> disk%d sec=%llu",
-	       rc->mirror_disk, (u64)rc->sector);
+	return;
 
-out:
+fail:
+	rc->orig_bio->bi_status = BLK_STS_IOERR;
+	bio_endio(rc->orig_bio);
+	bio_put(rc->orig_bio);
 	kfree(rc);
 }
 
@@ -282,45 +286,49 @@ int tieredvol_end_io(struct dm_target *ti, struct bio *bio, blk_status_t *error)
 					schedule_work(&ctx->trigger_event);
 				}
 
-				if (bio_data_dir(bio) == READ) {
-					int mirror;
+			if (bio_data_dir(bio) == READ) {
+				int mirror;
+				sector_t mirror_sector;
 
-					mirror = tv_pending_find_and_remove(
-						bio->bi_bdev,
-						bio->bi_iter.bi_sector,
-						bio->bi_iter.bi_size);
+				mirror = tv_pending_find_and_remove(
+					bio->bi_bdev,
+					bio->bi_iter.bi_sector,
+					bio->bi_iter.bi_size,
+					&mirror_sector);
 
-					if (mirror >= 0 &&
-					    mirror < ctx->ndisks) {
-						struct tv_retry_ctx *rc;
+				if (mirror >= 0 &&
+			    mirror < ctx->ndisks) {
+					struct tv_retry_ctx *rc;
 
-						rc = kmalloc(sizeof(*rc),
-							     GFP_ATOMIC);
-						if (rc) {
-							INIT_DELAYED_WORK(
-								&rc->dwork,
-								tv_read_retry_work);
-							rc->ctx = ctx;
-							rc->sector =
-								bio->bi_iter.bi_sector;
-							rc->size =
-								bio->bi_iter.bi_size;
-							rc->mirror_disk =
-								mirror;
-							rc->retries = 32;
-							schedule_delayed_work(
-								&rc->dwork, 0);
-							tv_log(TV_LOG_INFO,
-							       i,
-							       TV_LOG_MIRROR,
-							       "scheduling read retry -> disk%d",
-							       mirror);
-						}
+					rc = kmalloc(sizeof(*rc),
+						     GFP_ATOMIC);
+					if (rc) {
+						INIT_DELAYED_WORK(
+							&rc->dwork,
+							tv_read_retry_work);
+						rc->ctx = ctx;
+						rc->orig_bio = bio;
+						rc->sector = mirror_sector;
+						rc->size =
+							bio->bi_iter.bi_size;
+						rc->mirror_disk =
+							mirror;
+					rc->retries = 32;
+					bio_get(bio);
+					schedule_delayed_work(
+						&rc->dwork, 0);
+					return 1;
 					}
 				}
+			}
 				break;
 			}
 		}
+	} else if (bio_data_dir(bio) == READ) {
+		tv_pending_find_and_remove(bio->bi_bdev,
+					   bio->bi_iter.bi_sector,
+					   bio->bi_iter.bi_size,
+					   NULL);
 	}
 
 	return 0;

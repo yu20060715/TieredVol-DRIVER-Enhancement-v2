@@ -181,11 +181,18 @@ extern unsigned int log_size;
 extern struct workqueue_struct *tv_wq;
 
 /* ---- tieredvol_mirror.c exports ---- */
+struct tv_mirror_pw_ctx {
+	struct tieredvol_ctx *ctx;
+	struct block_device *bdev;
+	sector_t sector;
+	unsigned int size;
+};
 void tv_pw_add(struct block_device *bdev, sector_t sector, unsigned int size);
 void tv_pending_add(struct block_device *bdev, sector_t sector,
-		    unsigned int size, int mirror_disk);
+		    unsigned int size, int mirror_disk,
+		    sector_t mirror_sector);
 int tv_pending_find_and_remove(struct block_device *bdev, sector_t sector,
-			       unsigned int size);
+			       unsigned int size, sector_t *mirror_sector_out);
 void tv_mirror_end_io(struct bio *bio);
 int tieredvol_end_io(struct dm_target *ti, struct bio *bio,
 		     blk_status_t *error);
@@ -194,6 +201,7 @@ void tv_decay_timer_fn(struct timer_list *timer);
 struct tv_retry_ctx {
 	struct delayed_work dwork;
 	struct tieredvol_ctx *ctx;
+	struct bio *orig_bio;
 	sector_t sector;
 	unsigned int size;
 	int mirror_disk;

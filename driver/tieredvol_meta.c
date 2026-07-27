@@ -295,7 +295,7 @@ int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
 		}
 	}
 
-	/* Validate disk indices */
+	/* Validate disk indices and mirror safety */
 	{
 		u32 si, j;
 
@@ -309,6 +309,18 @@ int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
 					       meta->disk_count);
 					ret = -EINVAL;
 					goto out;
+				}
+			}
+
+			if (seg->mirror_enabled) {
+				for (j = 0; j < seg->disk_count; j++) {
+					if (seg->disk_index[j] ==
+					    seg->mirror_disk) {
+						pr_err("tieredvol: seg%u mirror_disk %u is a stripe participant\n",
+						       si, seg->mirror_disk);
+						ret = -EINVAL;
+						goto out;
+					}
 				}
 			}
 		}
