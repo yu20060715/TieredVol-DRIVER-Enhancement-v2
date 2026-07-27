@@ -20,7 +20,7 @@
 static int tv_metadata_save_kernel(struct tieredvol_ctx *ctx)
 {
 	struct file *f;
-	char buf[4096];
+	char *buf;
 	int off = 0;
 	int ret;
 	u32 crc;
@@ -29,6 +29,10 @@ static int tv_metadata_save_kernel(struct tieredvol_ctx *ctx)
 
 	if (!ctx->config_path[0])
 		return -ENOENT;
+
+	buf = kmalloc(4096, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
 
 	off += scnprintf(buf + off, sizeof(buf) - off, "[weighted_striping]\n");
 	off += scnprintf(buf + off, sizeof(buf) - off, "version=%u\n",
@@ -113,6 +117,7 @@ static int tv_metadata_save_kernel(struct tieredvol_ctx *ctx)
 	if (IS_ERR(f)) {
 		pr_err("tieredvol: save failed to open %s: %ld\n",
 		       ctx->config_path, PTR_ERR(f));
+		kfree(buf);
 		return PTR_ERR(f);
 	}
 
@@ -123,6 +128,7 @@ static int tv_metadata_save_kernel(struct tieredvol_ctx *ctx)
 	if (ret != off) {
 		pr_err("tieredvol: save write error %d (wrote %lld of %d)\n",
 		       ret, pos, off);
+		kfree(buf);
 		return ret < 0 ? ret : -EIO;
 	}
 
@@ -130,6 +136,7 @@ static int tv_metadata_save_kernel(struct tieredvol_ctx *ctx)
 	       crc);
 	pr_info("tieredvol: metadata saved crc=0x%08x to %s\n", crc,
 		ctx->config_path);
+	kfree(buf);
 	return 0;
 }
 
