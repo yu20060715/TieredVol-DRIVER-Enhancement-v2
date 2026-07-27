@@ -10,6 +10,7 @@
 #include "exec_helper.h"
 #include "cmd_create.h"
 #include "cmd_remove.h"
+#include "cmd_status.h"
 
 static void print_usage(const char *prog) {
     printf("TieredVol — Tiered Storage Volume Manager v%s\n\n", VERSION);

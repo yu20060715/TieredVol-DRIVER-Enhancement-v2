@@ -5,7 +5,7 @@ PREFIX=/usr/local
 SCHED_OBJS=src/tiered_partition.o src/tiered_mapper.o \
            src/tiered_metadata.o src/tiered_benchmark.o src/warmup.o
 
-SETUP_OBJS=src/exec_helper.o src/setup_discover.o src/setup_bench.o src/cmd_create.o src/cmd_remove.o
+SETUP_OBJS=src/exec_helper.o src/setup_discover.o src/setup_bench.o src/cmd_create.o src/cmd_remove.o src/cmd_status.o src/cmd_scheduler.o
 
 all: tiered_setup
 
@@ -39,7 +39,13 @@ src/setup_bench.o: src/setup_bench.c src/setup_bench.h src/setup_discover.h
 src/cmd_create.o: src/cmd_create.c src/cmd_create.h src/tiered_types.h src/setup_discover.h src/setup_bench.h src/exec_helper.h src/version.h src/tiered_common.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/cmd_remove.o: src/cmd_remove.c src/cmd_remove.h src/cmd_create.h src/tiered_types.h src/setup_discover.h src/exec_helper.h src/tiered_common.h
+src/cmd_remove.o: src/cmd_remove.c src/cmd_remove.h src/cmd_create.h src/tiered_types.h src/setup_discover.h src/exec_helper.h src/tiered_common.h src/cmd_status.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+src/cmd_status.o: src/cmd_status.c src/cmd_status.h src/tiered_types.h src/exec_helper.h src/tiered_common.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+src/cmd_scheduler.o: src/cmd_scheduler.c src/cmd_scheduler.h src/cmd_create.h src/tiered_types.h src/setup_discover.h src/setup_bench.h src/exec_helper.h src/version.h src/tiered_common.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Unit tests (no io_uring dependency — pure logic)
