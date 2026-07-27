@@ -136,6 +136,20 @@ void tv_decay_timer_fn(struct timer_list *timer)
 			(ctx->adaptive.ema_iops[i] * one_minus_alpha +
 			 completions * alpha) >> 10;
 
+		/* EMA latency (average latency per I/O in ns, smoothed) */
+		{
+			u64 completions_total =
+				(u64)atomic64_xchg(&ctx->io.total_completions[i], 0);
+			u64 latency_total =
+				(u64)atomic64_xchg(&ctx->io.total_latency_ns[i], 0);
+			u64 avg_latency = completions_total ?
+				latency_total / completions_total : 0;
+
+			ctx->adaptive.ema_latency_ns[i] =
+				(ctx->adaptive.ema_latency_ns[i] * one_minus_alpha +
+				 avg_latency * alpha) >> 10;
+		}
+
 		ctx->adaptive.last_interval_bytes[i] = snapshot;
 
 		if (ctx->adaptive.stale_after_ns > 0 && snapshot > 0)

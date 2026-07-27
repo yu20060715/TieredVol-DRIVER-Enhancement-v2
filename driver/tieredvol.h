@@ -144,7 +144,8 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 					    int ndisks,
 					    atomic64_t *total_write_bytes,
 					    u32 wear_bias,
-					    u32 chunk_size);
+					    u32 chunk_size,
+					    u64 *ema_latency_ns);
 struct tieredvol_map tv_map_logical_random(u64 logical,
 					  struct tieredvol_metadata *meta,
 					  u32 chunk_size);
@@ -219,6 +220,18 @@ struct tv_pending_write_cpu {
 	unsigned int count;
 };
 
+/* ---- Per-CPU timestamp ring for latency tracking ---- */
+struct tv_ts_entry {
+	sector_t sector;
+	ktime_t submit_ns;
+};
+
+struct tv_ts_ring_cpu {
+	struct tv_ts_entry entries[128];
+	unsigned int head;
+	unsigned int count;
+};
+
 /* ---- tieredvol_mirror.c exports ---- */
 struct tv_mirror_pw_ctx {
 	struct tieredvol_ctx *ctx;
@@ -232,6 +245,8 @@ void tv_pending_add(struct block_device *bdev, sector_t sector,
 		    sector_t mirror_sector);
 int tv_pending_find_and_remove(struct block_device *bdev, sector_t sector,
 			       unsigned int size, sector_t *mirror_sector_out);
+void tv_ts_submit(int disk_idx, sector_t sector);
+u64 tv_ts_complete(int disk_idx, sector_t sector);
 void tv_mirror_end_io(struct bio *bio);
 int tieredvol_end_io(struct dm_target *ti, struct bio *bio,
 		     blk_status_t *error);

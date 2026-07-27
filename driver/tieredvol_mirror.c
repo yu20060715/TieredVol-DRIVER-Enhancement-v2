@@ -150,6 +150,66 @@ static bool tv_pw_is_pending(struct block_device *bdev, sector_t sector,
 	return false;
 }
 
+/* ---- Timestamp ring for latency tracking (global, lightweight) ---- */
+
+struct tv_ts_ring {
+	struct tv_ts_entry entries[256];
+	unsigned int head;
+	unsigned int count;
+};
+
+static struct tv_ts_ring tv_ts_rings[TV_MAX_DISKS];
+static DEFINE_SPINLOCK(tv_ts_lock);
+
+void tv_ts_submit(int disk_idx, sector_t sector)
+{
+	unsigned long flags;
+	unsigned int idx;
+
+	if (disk_idx < 0 || disk_idx >= TV_MAX_DISKS)
+		return;
+
+	spin_lock_irqsave(&tv_ts_lock, flags);
+	idx = (tv_ts_rings[disk_idx].head + tv_ts_rings[disk_idx].count) % 256;
+	if (tv_ts_rings[disk_idx].count < 256) {
+		tv_ts_rings[disk_idx].entries[idx].sector = sector;
+		tv_ts_rings[disk_idx].entries[idx].submit_ns = ktime_get_ns();
+		tv_ts_rings[disk_idx].count++;
+	}
+	spin_unlock_irqrestore(&tv_ts_lock, flags);
+}
+EXPORT_SYMBOL_GPL(tv_ts_submit);
+
+u64 tv_ts_complete(int disk_idx, sector_t sector)
+{
+	unsigned long flags;
+	u64 delta = 0;
+	unsigned int i;
+
+	if (disk_idx < 0 || disk_idx >= TV_MAX_DISKS)
+		return 0;
+
+	spin_lock_irqsave(&tv_ts_lock, flags);
+	for (i = 0; i < tv_ts_rings[disk_idx].count; i++) {
+		unsigned int idx = (tv_ts_rings[disk_idx].head + i) % 256;
+
+		if (tv_ts_rings[disk_idx].entries[idx].sector == sector) {
+			delta = ktime_get_ns() - tv_ts_rings[disk_idx].entries[idx].submit_ns;
+			for (; i + 1 < tv_ts_rings[disk_idx].count; i++) {
+				unsigned int next = (tv_ts_rings[disk_idx].head + i + 1) % 256;
+
+				tv_ts_rings[disk_idx].entries[(tv_ts_rings[disk_idx].head + i) % 256] =
+					tv_ts_rings[disk_idx].entries[next];
+			}
+			tv_ts_rings[disk_idx].count--;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&tv_ts_lock, flags);
+	return delta;
+}
+EXPORT_SYMBOL_GPL(tv_ts_complete);
+
 /* ---- Mirror I/O completion ---- */
 
 void tv_mirror_end_io(struct bio *bio)
@@ -246,10 +306,20 @@ int tieredvol_end_io(struct dm_target *ti, struct bio *bio, blk_status_t *error)
 
 	/* Fix 2: Decrement in_flight_bytes on every completion */
 	if (disk_id >= 0) {
+		u64 latency_ns;
+
 		atomic_sub(bio->bi_iter.bi_size,
 			   &ctx->io.in_flight_bytes[disk_id]);
 		/* Adaptive v2: track completions per interval */
 		atomic64_inc(&ctx->io.interval_completions[disk_id]);
+		/* Latency tracking: record completion delta */
+		latency_ns = tv_ts_complete(disk_id,
+					    bio->bi_iter.bi_sector);
+		if (latency_ns > 0) {
+			atomic64_add(latency_ns,
+				     &ctx->io.total_latency_ns[disk_id]);
+			atomic64_inc(&ctx->io.total_completions[disk_id]);
+		}
 	}
 
 	/* Error path */

@@ -86,7 +86,8 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 					    int ndisks,
 					    atomic64_t *total_write_bytes,
 					    u32 wear_bias,
-					    u32 chunk_size)
+					    u32 chunk_size,
+					    u64 *ema_latency_ns)
 {
 	struct tieredvol_map err = { .disk = -1, .offset = 0, .length = 0 };
 	int seg_idx;
@@ -136,6 +137,10 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 
 		/* Latency penalty: higher latency → higher score */
 		score += ema_load[d] / 4;
+
+		/* Latency penalty from EMA latency (normalized to ~load scale) */
+		if (ema_latency_ns)
+			score += ema_latency_ns[d] / 1000000; /* ns → ms as score units */
 
 		/* Wear penalty */
 		if (wear_bias > 0 && total_writes > 0 && total_write_bytes)

@@ -47,7 +47,8 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 					      ctx->ndisks,
 					      ctx->io.total_write_bytes,
 					      ctx->adaptive.wear_bias,
-					      ctx->meta.chunk_size);
+					      ctx->meta.chunk_size,
+					      ctx->adaptive.ema_latency_ns);
 		break;
 	case TV_POLICY_RANDOM:
 		cur = tv_map_logical_random(logical, &ctx->meta,
@@ -72,6 +73,7 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 	bio_set_dev(bio, ctx->devs[cur.disk]->bdev);
 	bio->bi_iter.bi_sector = cur.offset >> TV_SECTOR_SHIFT;
 	atomic_add(bio->bi_iter.bi_size, &ctx->io.in_flight_bytes[cur.disk]);
+	tv_ts_submit(cur.disk, cur.offset >> TV_SECTOR_SHIFT);
 	if (bio_data_dir(bio) == WRITE) {
 		atomic64_add(bio->bi_iter.bi_size, &ctx->io.total_write_bytes[cur.disk]);
 		atomic64_inc(&ctx->io.total_write_ops[cur.disk]);
