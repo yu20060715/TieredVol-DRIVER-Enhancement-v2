@@ -1,5 +1,14 @@
 # Weighted I/O Scheduler — I/O Dispatch 實作
 
+> **⚠ Architecture Note (v5.0):** The original userspace io_uring scheduler described
+> below has been **replaced by a kernel dm-target module** (`driver/tieredvol.ko`).
+> Applications now use standard POSIX `write()`/`read()` on `/dev/mapper/<name>`.
+> The kernel module handles bio dispatch, weighted striping, mirror/RAID1, adaptive
+> load balancing, and staleness detection — all transparently. See `driver/` for the
+> current implementation, and `README.md` for the updated architecture overview.
+>
+> This document is retained as a historical reference for the algorithmic design.
+
 本文檔說明 TieredVol Scheduler 如何將加權切塊結果實際送出 I/O，包括 io_uring dispatch、stripe buffer、offset 映射、metadata 管理。
 
 前置閱讀：[PARTITION_SPLITTING.md](PARTITION_SPLITTING.md)（切塊演算法）
@@ -490,47 +499,59 @@ sudo tiered_io --path /mnt/test --bench --size 128MB
 
 ### 模組拆分
 
-對應到 TieredVol 的 `src/` 目錄：
+對應到 TieredVol 的目錄結構（v5.0 重構後）：
 
 ```
-src/
-├── tiered_sched.h          # 所有 struct + API 定義
-├── tiered_sched.c          # Scheduler 核心
-├── tiered_mapper.c         # Logical ↔ Physical offset 映射
-├── tiered_io_uring.c       # io_uring wrapper
-├── tiered_benchmark.c      # 測速
-├── tiered_partition.c      # Segment 計算
-├── tiered_metadata.c       # Metadata 讀寫
-├── tiered_io.c             # CLI I/O 工具（read/write/bench/info/path）
-├── tiered_setup.c          # CLI（加入 --scheduler 模式）
-└── tiered_common.h         # 共用驗證函式
+driver/                          # Kernel dm-target module
+├── tieredvol.h                  # Shared kernel types + API
+├── tieredvol_core.c             # DM lifecycle: ctr/dtr/map/status/ioctl
+├── tieredvol_map.c              # Logical ↔ Physical offset mapping (kernel)
+├── tieredvol_meta.c             # Metadata loading from config file
+├── tieredvol_message.c          # dmsetup message dispatch table (28 handlers)
+├── tieredvol_mirror.c           # Mirror/RAID1: bio clone, rebuild thread
+├── tieredvol_log.c              # Kfifo ring buffer + EMA decay + per-CPU stats
+└── tieredvol_sysfs.c            # /sys/kernel/tieredvol/ attributes
+
+src/                             # Userspace tool (tiered_setup)
+├── main.c                       # CLI entry point
+├── tieredvol_common.h           # Input validation (name, fs, mount)
+├── tieredvol_types.h            # Shared type definitions (TV_DISK, TV_SEGMENT, etc.)
+├── tieredvol_umapper.c          # Logical ↔ Physical offset mapping (userspace)
+├── tieredvol_partition.c        # Weight + segment calculation
+├── tieredvol_umeta.c            # Metadata save/load (INI format)
+├── tieredvol_benchmark.c        # Initialization benchmark
+├── tieredvol_warmup.c/h         # SLC cache warm-up
+├── tieredvol_exec.c/h           # External command execution
+├── tieredvol_discover.c/h       # Disk discovery (lsblk, sysfs)
+├── tieredvol_bench.c/h          # Setup benchmark logic
+├── cmd_create.c/h               # Volume creation (kernel dm + LVM)
+├── cmd_remove.c/h               # Volume removal
+├── cmd_status.c/h               # Target status queries
+└── cmd_scheduler.c/h            # Scheduler (DM) volume creation
+
+common/
+└── tieredvol_meta_format.h      # Shared format constants (kernel + userspace)
 ```
 
 ### API
 
-所有 API 定義在 `src/tiered_sched.h`。以下是簡要說明：
+The kernel module exposes a dm-target interface. Users interact via standard POSIX I/O on `/dev/mapper/<name>` and configure via `dmsetup message`:
 
 ```c
-// 初始化
-TV_SCHED *tv_sched_init(TV_DISK *disks, int ndisks, TV_METADATA *meta);
+// Kernel: dm_target ops (driver/tieredvol.h)
+int tieredvol_ctr(struct dm_target *ti, unsigned int argc, char **argv);
+void tieredvol_dtr(struct dm_target *ti);
+int tieredvol_map(struct dm_target *ti, struct bio *bio);
+int tieredvol_message(struct dm_target *ti, unsigned int argc,
+                      char **argv, char *result, unsigned int maxlen);
 
-// 寫入（自動 buffer + dispatch）
-int tv_write(TV_SCHED *sched, const void *buf, uint64_t len);
-
-// 讀取
-int tv_read(TV_SCHED *sched, void *buf, uint64_t len, uint64_t offset);
-
-// Flush（強制送出 partial stripe）
-int tv_flush(TV_SCHED *sched);
-
-// 清理
-void tv_sched_destroy(TV_SCHED *sched);
-
-// Offset Mapping（純數學，不碰 I/O）
-TV_MAP tv_map_logical(uint64_t logical, TV_METADATA *meta);
+// Kernel: offset mapping (driver/tieredvol.h)
+struct tieredvol_map tv_map_logical(u64 logical, struct tieredvol_metadata *meta,
+                                    u32 chunk_size);
+struct tieredvol_map tv_map_logical_adaptive(u64 logical, ...);
 ```
 
-完整實作見 `src/tiered_sched.h` 與 `src/tiered_sched.c`。
+完整實作見 `driver/` 目錄下各 `.c` 文件。
 
 ### 為什麼用 io_uring？
 

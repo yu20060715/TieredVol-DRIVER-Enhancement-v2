@@ -152,9 +152,14 @@ sudo tiered_setup --create --name fastpool \
 
 ---
 
-## I/O 工具 (tiered_io)
+## I/O 工具 (tiered_io) — DEPRECATED
 
-`tiered_io` 是 Weighted I/O Scheduler 的唯一 I/O 入口。用來驗證 scheduler 的 read/write/bench 功能。
+> **⚠ Removed in v5.0:** The `tiered_io` binary has been removed. The kernel
+> dm-target module now handles all I/O dispatch transparently. Use standard
+> `write()`/`read()` on `/dev/mapper/<name>` for data operations, and
+> `fio` for benchmarking. See `BENCHMARK.md` for benchmark commands.
+
+`tiered_io` was the Weighted I/O Scheduler's I/O entry point. It is no longer part of the build.
 
 ### 查看 Volume 資訊
 

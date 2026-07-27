@@ -8,7 +8,7 @@
 
 ## 資料結構
 
-所有 struct 定義在 `src/tiered_sched.h`。以下是說明：
+所有 struct 定義在 `src/tieredvol_types.h`。以下是說明：
 
 ### TV_DISK
 
@@ -111,7 +111,7 @@ SATA:   480 MB/s
 
 ### 方法：四捨五入 + 上限
 
-目前實作（`tv_compute_weight()` in `tiered_partition.c`）採用簡單的四捨五入：
+目前實作（`tv_compute_weight()` in `tieredvol_partition.c`）採用簡單的四捨五入：
 
 ```c
 double w = speed / slowest;
@@ -192,7 +192,7 @@ C 只有 512GB，A 和 B 有 1TB。當 C 用完後，剩下三顆碟的比例就
 
 分段資訊：邏輯 offset 範圍, 碟數量, 碟 index 陣列, 權重陣列, stripe size。
 
-定義見 `src/tiered_sched.h`。
+定義見 `src/tieredvol_types.h`。
 
 #### 範例
 
@@ -255,7 +255,7 @@ SATA 應拿：2400 × 480/1714  = 672KB
 
 ## Metadata
 
-Metadata 結構定義在 `src/tiered_sched.h`（TV_METADATA）。
+Metadata 結構定義在 `src/tieredvol_types.h`（TV_METADATA）。
 
 儲存格式：
 ```
@@ -283,7 +283,7 @@ seg0_stripe=3670016
 ## Runtime Mapping API
 
 ```c
-// 定義在 src/tiered_sched.h
+// 定義在 src/tieredvol_types.h
 
 TV_MAP tv_map_logical(uint64_t logical, TV_METADATA *meta);
 ```
@@ -340,5 +340,5 @@ sudo tiered_setup --create --name fastpool --disks nvme0n1:500,sda:500,sdb:500 -
 ## 參考
 
 - Weighted striping 概念：參考儲存領域已有的 weighted allocation 概念
-- Ratio 近似演算法：四捨五入 + 上限（tv_compute_weight in tiered_partition.c）
+- Ratio 近似演算法：四捨五入 + 上限（tv_compute_weight in tieredvol_partition.c）
 - 相關文件：[WEIGHTED_IO_SCHEDULER.md](WEIGHTED_IO_SCHEDULER.md)（I/O dispatch 實作）
