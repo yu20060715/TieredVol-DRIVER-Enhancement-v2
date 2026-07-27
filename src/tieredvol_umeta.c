@@ -3,7 +3,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
-#include "tiered_types.h"
+#include "tieredvol_types.h"
 
 /* CRC32C (Castagnoli) — matches kernel crc32c */
 static uint32_t crc32c_table[256];

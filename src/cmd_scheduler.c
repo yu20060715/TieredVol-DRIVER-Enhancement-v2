@@ -3,12 +3,12 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include "tiered_common.h"
-#include "tiered_types.h"
+#include "tieredvol_common.h"
+#include "tieredvol_types.h"
 #include "version.h"
-#include "setup_discover.h"
-#include "setup_bench.h"
-#include "exec_helper.h"
+#include "tieredvol_discover.h"
+#include "tieredvol_bench.h"
+#include "tieredvol_exec.h"
 #include "cmd_create.h"
 #include "cmd_scheduler.h"
 

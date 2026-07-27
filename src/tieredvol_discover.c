@@ -1,8 +1,8 @@
 #include <stdio.h>
 #include <string.h>
-#include "tiered_common.h"
-#include "tiered_types.h"
-#include "setup_discover.h"
+#include "tieredvol_common.h"
+#include "tieredvol_types.h"
+#include "tieredvol_discover.h"
 
 long long sysfs_size_gb(const char *disk) {
     char path[256];

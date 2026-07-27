@@ -1,5 +1,5 @@
-#ifndef EXEC_HELPER_H
-#define EXEC_HELPER_H
+#ifndef TIEREDVOL_EXEC_H
+#define TIEREDVOL_EXEC_H
 
 #include <stddef.h>
 

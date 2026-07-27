@@ -1,5 +1,5 @@
-#ifndef SETUP_DISCOVER_H
-#define SETUP_DISCOVER_H
+#ifndef TIEREDVOL_DISCOVER_H
+#define TIEREDVOL_DISCOVER_H
 
 #include <stdint.h>
 #include <stddef.h>

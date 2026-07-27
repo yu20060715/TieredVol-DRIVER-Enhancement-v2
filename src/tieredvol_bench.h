@@ -1,7 +1,7 @@
-#ifndef SETUP_BENCH_H
-#define SETUP_BENCH_H
+#ifndef TIEREDVOL_BENCH_H
+#define TIEREDVOL_BENCH_H
 
-#include "setup_discover.h"
+#include "tieredvol_discover.h"
 
 typedef void (*bench_interrupt_fn)(void *ctx);
 

@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <string.h>
-#include "../src/tiered_common.h"
+#include "../src/tieredvol_common.h"
 #include "test_common.h"
 
 static void test_valid_name(void) {

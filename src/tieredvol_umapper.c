@@ -1,5 +1,5 @@
 #include <stdint.h>
-#include "tiered_types.h"
+#include "tieredvol_types.h"
 
 TV_MAP tv_map_logical(uint64_t logical, TV_METADATA *meta) {
     TV_MAP err = {-1, 0, 0};

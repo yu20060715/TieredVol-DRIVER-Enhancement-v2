@@ -4,8 +4,8 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
-#include "tiered_types.h"
-#include "exec_helper.h"
+#include "tieredvol_types.h"
+#include "tieredvol_exec.h"
 
 int tv_exec_run(const char *path, char *const argv[]) {
     pid_t pid = fork();

@@ -1,5 +1,5 @@
-#ifndef WARMUP_H
-#define WARMUP_H
+#ifndef TIEREDVOL_WARMUP_H
+#define TIEREDVOL_WARMUP_H
 
 #include <stdint.h>
 

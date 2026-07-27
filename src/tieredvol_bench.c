@@ -12,12 +12,12 @@
 #include <limits.h>
 #include <errno.h>
 #include <linux/fs.h>
-#include "tiered_common.h"
-#include "tiered_types.h"
-#include "setup_discover.h"
-#include "setup_bench.h"
-#include "exec_helper.h"
-#include "warmup.h"
+#include "tieredvol_common.h"
+#include "tieredvol_types.h"
+#include "tieredvol_discover.h"
+#include "tieredvol_bench.h"
+#include "tieredvol_exec.h"
+#include "tieredvol_warmup.h"
 
 static volatile sig_atomic_t bench_interrupted = 0;
 

@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <string.h>
-#include "../src/tiered_types.h"
+#include "../src/tieredvol_types.h"
 #include "test_common.h"
 
 static TV_METADATA single_seg_meta(void) {

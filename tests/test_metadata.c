@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include "../src/tiered_types.h"
+#include "../src/tieredvol_types.h"
 #include "test_common.h"
 
 static TV_METADATA make_test_meta(void) {

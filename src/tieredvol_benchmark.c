@@ -5,8 +5,8 @@
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
-#include "tiered_types.h"
-#include "warmup.h"
+#include "tieredvol_types.h"
+#include "tieredvol_warmup.h"
 
 volatile sig_atomic_t g_shutdown_requested = 0;
 

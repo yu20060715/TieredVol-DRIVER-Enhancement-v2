@@ -2,63 +2,63 @@ CC=gcc
 CFLAGS=-D_GNU_SOURCE -Wall -Wextra -Wpedantic -std=gnu11 -O2 -Icommon
 PREFIX=/usr/local
 
-SCHED_OBJS=src/tiered_partition.o src/tiered_mapper.o \
-           src/tiered_metadata.o src/tiered_benchmark.o src/warmup.o
+SCHED_OBJS=src/tieredvol_partition.o src/tieredvol_umapper.o \
+           src/tieredvol_umeta.o src/tieredvol_benchmark.o src/tieredvol_warmup.o
 
-SETUP_OBJS=src/exec_helper.o src/setup_discover.o src/setup_bench.o src/cmd_create.o src/cmd_remove.o src/cmd_status.o src/cmd_scheduler.o
+SETUP_OBJS=src/tieredvol_exec.o src/tieredvol_discover.o src/tieredvol_bench.o src/cmd_create.o src/cmd_remove.o src/cmd_status.o src/cmd_scheduler.o
 
 all: tiered_setup
 
-tiered_setup: src/main.c src/tiered_common.h src/tiered_types.h src/version.h src/setup_discover.h src/setup_bench.h src/exec_helper.h src/cmd_create.h src/cmd_remove.h $(SCHED_OBJS) $(SETUP_OBJS)
+tiered_setup: src/main.c src/tieredvol_common.h src/tieredvol_types.h src/version.h src/tieredvol_discover.h src/tieredvol_bench.h src/tieredvol_exec.h src/cmd_create.h src/cmd_remove.h $(SCHED_OBJS) $(SETUP_OBJS)
 	$(CC) $(CFLAGS) -o $@ src/main.c $(SCHED_OBJS) $(SETUP_OBJS) -lm
 
-src/tiered_partition.o: src/tiered_partition.c src/tiered_types.h
+src/tieredvol_partition.o: src/tieredvol_partition.c src/tieredvol_types.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/tiered_mapper.o: src/tiered_mapper.c src/tiered_types.h
+src/tieredvol_umapper.o: src/tieredvol_umapper.c src/tieredvol_types.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/tiered_metadata.o: src/tiered_metadata.c src/tiered_types.h
+src/tieredvol_umeta.o: src/tieredvol_umeta.c src/tieredvol_types.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/tiered_benchmark.o: src/tiered_benchmark.c src/tiered_types.h src/warmup.h
+src/tieredvol_benchmark.o: src/tieredvol_benchmark.c src/tieredvol_types.h src/tieredvol_warmup.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/warmup.o: src/warmup.c src/warmup.h src/tiered_types.h
+src/tieredvol_warmup.o: src/tieredvol_warmup.c src/tieredvol_warmup.h src/tieredvol_types.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/exec_helper.o: src/exec_helper.c src/exec_helper.h
+src/tieredvol_exec.o: src/tieredvol_exec.c src/tieredvol_exec.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/setup_discover.o: src/setup_discover.c src/setup_discover.h
+src/tieredvol_discover.o: src/tieredvol_discover.c src/tieredvol_discover.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/setup_bench.o: src/setup_bench.c src/setup_bench.h src/setup_discover.h
+src/tieredvol_bench.o: src/tieredvol_bench.c src/tieredvol_bench.h src/tieredvol_discover.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/cmd_create.o: src/cmd_create.c src/cmd_create.h src/tiered_types.h src/setup_discover.h src/setup_bench.h src/exec_helper.h src/version.h src/tiered_common.h
+src/cmd_create.o: src/cmd_create.c src/cmd_create.h src/tieredvol_types.h src/tieredvol_discover.h src/tieredvol_bench.h src/tieredvol_exec.h src/version.h src/tieredvol_common.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/cmd_remove.o: src/cmd_remove.c src/cmd_remove.h src/cmd_create.h src/tiered_types.h src/setup_discover.h src/exec_helper.h src/tiered_common.h src/cmd_status.h
+src/cmd_remove.o: src/cmd_remove.c src/cmd_remove.h src/cmd_create.h src/tieredvol_types.h src/tieredvol_discover.h src/tieredvol_exec.h src/tieredvol_common.h src/cmd_status.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/cmd_status.o: src/cmd_status.c src/cmd_status.h src/tiered_types.h src/exec_helper.h src/tiered_common.h
+src/cmd_status.o: src/cmd_status.c src/cmd_status.h src/tieredvol_types.h src/tieredvol_exec.h src/tieredvol_common.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/cmd_scheduler.o: src/cmd_scheduler.c src/cmd_scheduler.h src/cmd_create.h src/tiered_types.h src/setup_discover.h src/setup_bench.h src/exec_helper.h src/version.h src/tiered_common.h
+src/cmd_scheduler.o: src/cmd_scheduler.c src/cmd_scheduler.h src/cmd_create.h src/tieredvol_types.h src/tieredvol_discover.h src/tieredvol_bench.h src/tieredvol_exec.h src/version.h src/tieredvol_common.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Unit tests (no io_uring dependency — pure logic)
-test_common: tests/test_common.c src/tiered_common.h
+test_common: tests/test_common.c src/tieredvol_common.h
 	$(CC) $(CFLAGS) -o $@ $<
 
-test_mapper: tests/test_mapper.c src/tiered_types.h $(SCHED_OBJS)
+test_mapper: tests/test_mapper.c src/tieredvol_types.h $(SCHED_OBJS)
 	$(CC) $(CFLAGS) -o $@ $< $(SCHED_OBJS)
 
-test_partition: tests/test_partition.c src/tiered_types.h $(SCHED_OBJS)
+test_partition: tests/test_partition.c src/tieredvol_types.h $(SCHED_OBJS)
 	$(CC) $(CFLAGS) -o $@ $< $(SCHED_OBJS)
 
-test_metadata: tests/test_metadata.c src/tiered_types.h $(SCHED_OBJS)
+test_metadata: tests/test_metadata.c src/tieredvol_types.h $(SCHED_OBJS)
 	$(CC) $(CFLAGS) -o $@ $< $(SCHED_OBJS)
 
 test: test_common test_mapper test_partition test_metadata

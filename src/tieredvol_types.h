@@ -1,5 +1,5 @@
-#ifndef TIERED_TYPES_H
-#define TIERED_TYPES_H
+#ifndef TIEREDVOL_TYPES_H
+#define TIEREDVOL_TYPES_H
 
 #include <stdint.h>
 #include <signal.h>

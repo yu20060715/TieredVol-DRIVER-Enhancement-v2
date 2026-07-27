@@ -1,5 +1,5 @@
-#ifndef TIERED_COMMON_H
-#define TIERED_COMMON_H
+#ifndef TIEREDVOL_COMMON_H
+#define TIEREDVOL_COMMON_H
 
 #include <string.h>
 

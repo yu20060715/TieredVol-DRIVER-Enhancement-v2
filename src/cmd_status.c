@@ -3,9 +3,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <dirent.h>
-#include "tiered_common.h"
-#include "tiered_types.h"
-#include "exec_helper.h"
+#include "tieredvol_common.h"
+#include "tieredvol_types.h"
+#include "tieredvol_exec.h"
 #include "cmd_status.h"
 
 int is_kernel_target(const char *name) {

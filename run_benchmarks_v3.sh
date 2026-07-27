@@ -101,7 +101,7 @@ sleep 10
 echo "[T6] TieredVol chunk size sweep — 3 runs each"
 for CHUNK_KB in 256 512; do
     echo "[T6] Rebuilding with TV_CHUNK_SIZE=${CHUNK_KB}KB"
-    sed -i "s/#define TV_CHUNK_SIZE.*/#define TV_CHUNK_SIZE (${CHUNK_KB} * 1024)/" src/tiered_types.h
+    sed -i "s/#define TV_CHUNK_SIZE.*/#define TV_CHUNK_SIZE (${CHUNK_KB} * 1024)/" src/tieredvol_types.h
     make clean && make 2>&1 | tail -3
 
     sudo ./tiered_setup --create --name tv_chunk_${CHUNK_KB} \
@@ -118,7 +118,7 @@ done
 
 # Restore default chunk size
 echo "Restoring default chunk size (1MB)..."
-sed -i "s/#define TV_CHUNK_SIZE.*/#define TV_CHUNK_SIZE (1 * 1024 * 1024)/" src/tiered_types.h
+sed -i "s/#define TV_CHUNK_SIZE.*/#define TV_CHUNK_SIZE (1 * 1024 * 1024)/" src/tieredvol_types.h
 make clean && make 2>&1 | tail -3
 sleep 5
 

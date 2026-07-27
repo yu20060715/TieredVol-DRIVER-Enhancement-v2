@@ -4,8 +4,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-#include "warmup.h"
-#include "tiered_types.h"
+#include "tieredvol_warmup.h"
+#include "tieredvol_types.h"
 
 int tv_warmup_device(const char *path, uint64_t target_bytes) {
     int fd = open(path, O_WRONLY | O_DIRECT);

@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "tiered_types.h"
+#include "tieredvol_types.h"
 
 uint32_t tv_compute_weight(uint64_t speed, uint64_t slowest) {
     if (slowest == 0) return 1;
