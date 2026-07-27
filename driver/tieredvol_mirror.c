@@ -159,9 +159,9 @@ struct tv_ts_ring {
 };
 
 static struct tv_ts_ring tv_ts_rings[TV_MAX_DISKS];
-static DEFINE_SPINLOCK(tv_ts_lock);
+spinlock_t tv_ts_lock_arr[TV_MAX_DISKS];
 
-void tv_ts_submit(int disk_idx, sector_t sector)
+void tv_ts_submit(int disk_idx, sector_t sector, unsigned int size)
 {
 	unsigned long flags;
 	unsigned int idx;
@@ -169,18 +169,19 @@ void tv_ts_submit(int disk_idx, sector_t sector)
 	if (disk_idx < 0 || disk_idx >= TV_MAX_DISKS)
 		return;
 
-	spin_lock_irqsave(&tv_ts_lock, flags);
+	spin_lock_irqsave(&tv_ts_lock_arr[disk_idx], flags);
 	idx = (tv_ts_rings[disk_idx].head + tv_ts_rings[disk_idx].count) % 256;
 	if (tv_ts_rings[disk_idx].count < 256) {
 		tv_ts_rings[disk_idx].entries[idx].sector = sector;
+		tv_ts_rings[disk_idx].entries[idx].size = size;
 		tv_ts_rings[disk_idx].entries[idx].submit_ns = ktime_get_ns();
 		tv_ts_rings[disk_idx].count++;
 	}
-	spin_unlock_irqrestore(&tv_ts_lock, flags);
+	spin_unlock_irqrestore(&tv_ts_lock_arr[disk_idx], flags);
 }
 EXPORT_SYMBOL_GPL(tv_ts_submit);
 
-u64 tv_ts_complete(int disk_idx, sector_t sector)
+u64 tv_ts_complete(int disk_idx, sector_t sector, unsigned int size)
 {
 	unsigned long flags;
 	u64 delta = 0;
@@ -189,11 +190,12 @@ u64 tv_ts_complete(int disk_idx, sector_t sector)
 	if (disk_idx < 0 || disk_idx >= TV_MAX_DISKS)
 		return 0;
 
-	spin_lock_irqsave(&tv_ts_lock, flags);
+	spin_lock_irqsave(&tv_ts_lock_arr[disk_idx], flags);
 	for (i = 0; i < tv_ts_rings[disk_idx].count; i++) {
 		unsigned int idx = (tv_ts_rings[disk_idx].head + i) % 256;
 
-		if (tv_ts_rings[disk_idx].entries[idx].sector == sector) {
+		if (tv_ts_rings[disk_idx].entries[idx].sector == sector &&
+		    tv_ts_rings[disk_idx].entries[idx].size == size) {
 			delta = ktime_get_ns() - tv_ts_rings[disk_idx].entries[idx].submit_ns;
 			for (; i + 1 < tv_ts_rings[disk_idx].count; i++) {
 				unsigned int next = (tv_ts_rings[disk_idx].head + i + 1) % 256;
@@ -205,7 +207,7 @@ u64 tv_ts_complete(int disk_idx, sector_t sector)
 			break;
 		}
 	}
-	spin_unlock_irqrestore(&tv_ts_lock, flags);
+	spin_unlock_irqrestore(&tv_ts_lock_arr[disk_idx], flags);
 	return delta;
 }
 EXPORT_SYMBOL_GPL(tv_ts_complete);
@@ -314,7 +316,8 @@ int tieredvol_end_io(struct dm_target *ti, struct bio *bio, blk_status_t *error)
 		atomic64_inc(&ctx->io.interval_completions[disk_id]);
 		/* Latency tracking: record completion delta */
 		latency_ns = tv_ts_complete(disk_id,
-					    bio->bi_iter.bi_sector);
+					    bio->bi_iter.bi_sector,
+					    bio->bi_iter.bi_size);
 		if (latency_ns > 0) {
 			atomic64_add(latency_ns,
 				     &ctx->io.total_latency_ns[disk_id]);

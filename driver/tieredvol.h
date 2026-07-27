@@ -188,6 +188,7 @@ enum tv_log_event {
 
 extern struct kfifo tv_log_fifo;
 extern raw_spinlock_t tv_log_lock;
+extern spinlock_t tv_ts_lock_arr[];
 extern u8 tv_log_level;
 extern unsigned int log_size;
 extern struct workqueue_struct *tv_wq;
@@ -223,6 +224,7 @@ struct tv_pending_write_cpu {
 /* ---- Per-CPU timestamp ring for latency tracking ---- */
 struct tv_ts_entry {
 	sector_t sector;
+	unsigned int size;
 	ktime_t submit_ns;
 };
 
@@ -245,8 +247,8 @@ void tv_pending_add(struct block_device *bdev, sector_t sector,
 		    sector_t mirror_sector);
 int tv_pending_find_and_remove(struct block_device *bdev, sector_t sector,
 			       unsigned int size, sector_t *mirror_sector_out);
-void tv_ts_submit(int disk_idx, sector_t sector);
-u64 tv_ts_complete(int disk_idx, sector_t sector);
+void tv_ts_submit(int disk_idx, sector_t sector, unsigned int size);
+u64 tv_ts_complete(int disk_idx, sector_t sector, unsigned int size);
 void tv_mirror_end_io(struct bio *bio);
 int tieredvol_end_io(struct dm_target *ti, struct bio *bio,
 		     blk_status_t *error);

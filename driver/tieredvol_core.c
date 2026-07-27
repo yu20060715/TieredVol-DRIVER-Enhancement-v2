@@ -73,7 +73,8 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 	bio_set_dev(bio, ctx->devs[cur.disk]->bdev);
 	bio->bi_iter.bi_sector = cur.offset >> TV_SECTOR_SHIFT;
 	atomic_add(bio->bi_iter.bi_size, &ctx->io.in_flight_bytes[cur.disk]);
-	tv_ts_submit(cur.disk, cur.offset >> TV_SECTOR_SHIFT);
+	tv_ts_submit(cur.disk, cur.offset >> TV_SECTOR_SHIFT,
+		     bio->bi_iter.bi_size);
 	if (bio_data_dir(bio) == WRITE) {
 		atomic64_add(bio->bi_iter.bi_size, &ctx->io.total_write_bytes[cur.disk]);
 		atomic64_inc(&ctx->io.total_write_ops[cur.disk]);
@@ -521,7 +522,7 @@ static struct target_type tieredvol_target = {
 	.name   = "tieredvol",
 	.version = {2, 0, 0},
 	.module = THIS_MODULE,
-	.features = DM_TARGET_NOWAIT | DM_TARGET_PASSES_CRYPTO,
+	.features = DM_TARGET_NOWAIT,
 	.ctr    = tieredvol_ctr,
 	.dtr    = tieredvol_dtr,
 	.map    = tieredvol_map,
@@ -566,6 +567,15 @@ static int __init tieredvol_init(void)
 	}
 
 	tv_sysfs_init();
+
+	/* Initialize per-disk timestamp ring locks */
+	{
+		int k;
+
+		for (k = 0; k < TV_MAX_DISKS; k++)
+			spin_lock_init(&tv_ts_lock_arr[k]);
+	}
+
 	pr_info("tieredvol: module loaded (log_size=%u)\n", log_size);
 	return 0;
 }

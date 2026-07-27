@@ -356,6 +356,9 @@ static int msg_reset_io_stats(struct dm_target *ti, unsigned int argc,
 		atomic64_set(&ctx->io.total_write_bytes[i], 0);
 		atomic64_set(&ctx->io.total_read_ops[i], 0);
 		atomic64_set(&ctx->io.total_write_ops[i], 0);
+		atomic64_set(&ctx->io.total_latency_ns[i], 0);
+		atomic64_set(&ctx->io.total_completions[i], 0);
+		atomic64_set(&ctx->io.interval_completions[i], 0);
 	}
 	pr_info("tieredvol: IO stats reset\n");
 	return 0;
@@ -453,24 +456,34 @@ static int msg_set_mirror(struct dm_target *ti, unsigned int argc,
 static int msg_show_log(struct dm_target *ti, unsigned int argc,
 			char **argv, char *result, unsigned int maxlen)
 {
-	struct tv_log_entry entry;
+	struct tv_log_entry *entries;
 	unsigned long flags;
 	int cnt = 0;
+	int i;
+
+	entries = kmalloc_array(64, sizeof(*entries), GFP_KERNEL);
+	if (!entries)
+		return -ENOMEM;
 
 	raw_spin_lock_irqsave(&tv_log_lock, flags);
-	while (cnt < 64 && kfifo_out(&tv_log_fifo, &entry, sizeof(entry))) {
-		pr_info("tieredvol: LOG %s %s: %s\n",
-			entry.level == TV_LOG_ERR ? "ERR" :
-			entry.level == TV_LOG_WARN ? "WRN" : "INF",
-			entry.event_type == TV_LOG_STALE ? "STALE" :
-			entry.event_type == TV_LOG_RECOVER ? "RCVR" :
-			entry.event_type == TV_LOG_MIRROR ? "MIRR" :
-			entry.event_type == TV_LOG_CONFIG ? "CONF" :
-			entry.event_type == TV_LOG_IO ? "I/O" : "???",
-			entry.msg);
+	while (cnt < 64 && kfifo_out(&tv_log_fifo, &entries[cnt], sizeof(entries[0])))
 		cnt++;
-	}
+	for (i = 0; i < cnt; i++)
+		kfifo_in(&tv_log_fifo, &entries[i], sizeof(entries[0]));
 	raw_spin_unlock_irqrestore(&tv_log_lock, flags);
+
+	for (i = 0; i < cnt; i++)
+		pr_info("tieredvol: LOG %s %s: %s\n",
+			entries[i].level == TV_LOG_ERR ? "ERR" :
+			entries[i].level == TV_LOG_WARN ? "WRN" : "INF",
+			entries[i].event_type == TV_LOG_STALE ? "STALE" :
+			entries[i].event_type == TV_LOG_RECOVER ? "RCVR" :
+			entries[i].event_type == TV_LOG_MIRROR ? "MIRR" :
+			entries[i].event_type == TV_LOG_CONFIG ? "CONF" :
+			entries[i].event_type == TV_LOG_IO ? "I/O" : "???",
+			entries[i].msg);
+
+	kfree(entries);
 
 	if (cnt == 0)
 		pr_info("tieredvol: LOG EMPTY\n");

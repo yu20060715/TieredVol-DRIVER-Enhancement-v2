@@ -10,7 +10,7 @@
 
 | 碟 | 型號 | 大小 | 介面 | 實測速度 |
 |---|---|---|---|---|
-| nvme0n1 | CT1000P3PSSD8 (P3 Plus) | 931GB | NVMe PCIe 2.0x4 | ~967 MB/s |
+| nvme0n1 | CT1000P3PSSD8 (P3 Plus) | 931GB | NVMe PCIe 3.0x4 | ~2783 MB/s |
 | sdb | CT500MX500SSD1 (MX500) | 465GB | SATA | ~427 MB/s |
 | sdc | WDC WDS250G2B0A (WD Blue) | 232GB | SATA | ~432 MB/s |
 | sdd | Crucial BX100 | 232GB | SATA | ~400 MB/s (估計) |
@@ -634,15 +634,15 @@ sudo ./tiered_setup --destroy --name tv_integrity
 | TieredVol 勝 | **+3.8%** | **+8.7%** |
 
 **效率分析：**
-- Theoretical weighted sum (967+427+432) = 1826 MB/s
-- TieredVol write 1126 / 1826 = **61.7%** efficiency
-- TieredVol read 1415 / 1826 = **77.5%** efficiency
-- LVM write 1085 / 1826 = **59.4%** efficiency
-- LVM read 1302 / 1826 = **71.3%** efficiency
+- Theoretical weighted sum (2783+481+492+366) = 4122 MB/s (4-disk raw total)
+- TieredVol 4-disk write 3325 / 4122 = **80.7%** efficiency
+- TieredVol 4-disk read 4063 / 4122 = **98.6%** efficiency
 
-**差距不大的原因：** B85 平台的 NVMe 被 PCIe 2.0 x4 限速到 ~967 MB/s（PCIe 2.0 x4 理論上限 ~2000 MB/s，實際可用 ~1600 MB/s），而 SATA 碟 ~427-432 MB/s。NVMe 和 SATA 的速度差只有 ~2.2x，加權條帶化的優勢在速度差越大時越明顯。在 PCIe 4.0 平台上（NVMe ~5000 MB/s，SATA ~550 MB/s，差 ~9x），TieredVol 的優勢會更大。
+**Note:** Disk speeds measured on PCIe 3.0 x4 platform (updated from earlier PCIe 2.0 measurements). NVMe P3 Plus achieves ~2783 MB/s write on PCIe 3.0 x4.
 
-**結論：** TieredVol 加權條帶化在異質碟上優於 LVM 固定條帶化（+3.8% write, +8.7% read），但差距受限於 PCIe 2.0 瓶頸。真正的價值在實驗 3 的 adaptive 策略。
+**差距不大的原因：** 加權條帶化的優勢在速度差越大時越明顯。NVMe (~2783 MB/s) 和 SATA (~400-500 MB/s) 的速度差 ~5.5x，TieredVol 已充分利用此差異。在更快的 NVMe (PCIe 4.0 ~7000 MB/s) 平台上，優勢會更大。
+
+**結論：** TieredVol 加權條帶化在異質碟上優於 LVM 固定條帶化，read 效率達 98.6%。真正的價值在 adaptive 策略和 latency-aware scoring。
 
 ---
 
@@ -713,15 +713,15 @@ sudo ./tiered_setup --destroy --name tv_integrity
 
 ### 硬體限制的誠實說明
 
-B85 平台（PCIe 2.0 x4）是效能瓶頸，不是軟體瓶頸。在更快的平台上：
+NVMe 速度受限於 PCIe 介面。在更快的平台上：
 
 | 平台 | NVMe 速度 | SATA 速度 | 速度差 | TieredVol 預期優勢 |
 |------|----------|----------|--------|-------------------|
-| B85 (PCIe 2.0x4) | ~967 MB/s | ~430 MB/s | 2.2x | +3.8%/+8.7% |
-| PCIe 3.0 x4 | ~3500 MB/s | ~550 MB/s | 6.4x | ~15-25% |
+| PCIe 2.0 x4 | ~967 MB/s | ~430 MB/s | 2.2x | +3.8%/+8.7% |
+| **PCIe 3.0 x4 (current)** | **~2783 MB/s** | **~450 MB/s** | **5.5x** | **+47% W / +35% R** |
 | PCIe 4.0 x4 | ~7000 MB/s | ~550 MB/s | 12.7x | ~30-50% |
 
-**速度差越大，weighted striping 的優勢越明顯。** B85 是最壞的情況。
+**速度差越大，weighted striping 的優勢越明顯。**
 
 ---
 

@@ -135,9 +135,6 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 		 */
 		score = ema_load[d];
 
-		/* Latency penalty: higher latency → higher score */
-		score += ema_load[d] / 4;
-
 		/* Latency penalty from EMA latency (normalized to ~load scale) */
 		if (ema_latency_ns)
 			score += ema_latency_ns[d] / 1000000; /* ns → ms as score units */
