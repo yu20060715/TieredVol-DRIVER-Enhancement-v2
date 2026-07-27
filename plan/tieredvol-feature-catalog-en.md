@@ -1,715 +1,1020 @@
-# TieredVol v4.6.0 Feature Catalog
+# TieredVol v5.0.0 Feature Catalog
 
-Technical reference for all implemented features in the TieredVol device-mapper target.
+Technical reference for all implemented features in the TieredVol device-mapper target. v5.0.0 is a complete rewrite of v4.6.0.
+
+---
+
+## File Structure (v5.0)
+
+| File | Responsibility | Lines |
+|------|----------------|-------|
+| `tieredvol.h` | Header — all struct definitions | 258 |
+| `tieredvol_core.c` | DM lifecycle, map dispatch, module init/exit | 595 |
+| `tieredvol_map.c` | Logical→physical mapping: static/adaptive/random | 219 |
+| `tieredvol_mirror.c` | Mirror I/O, per-CPU pending, ts ring, retry, rebuild | 571 |
+| `tieredvol_log.c` | Log ring, EMA decay timer | 146 |
+| `tieredvol_meta.c` | Config parser + CRC32C | 397 |
+| `tieredvol_message.c` | 27 dmsetup message handlers | 780 |
+| `tieredvol_sysfs.c` | sysfs interface (7 attributes) | 273 |
+
+---
+
+## Core Data Structures
+
+### struct tieredvol_segment (tieredvol.h:20-29)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `logical_begin` | `sector_t` | Segment start sector |
+| `logical_end` | `sector_t` | Segment end sector |
+| `disk_count` | `u32` | Number of disks in segment |
+| `disk_index[16]` | `u32` | Disk index array |
+| `weight[16]` | `u32` | Weighted stripe weights |
+| `stripe_size` | `u32` | Stripe size (sectors) |
+| `mirror_enabled` | `bool` | Mirror enable flag |
+| `mirror_disk` | `u32` | Mirror target disk index |
+
+### struct tieredvol_metadata (tieredvol.h:31-43)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `version` | `u32` | Config version |
+| `chunk_size` | `u32` | Base chunk size (bytes) |
+| `segment_count` | `u32` | Number of segments |
+| `disk_count` | `u32` | Number of disks |
+| `disk_names[16][64]` | `char` | Disk device paths |
+| `segments[16]` | `struct tieredvol_segment` | Segment array |
+| `runtime_policy` | `int` | Runtime policy (override) |
+| `stale_ms` | `u32` | Stale timeout (ms) |
+| `ema_shift` | `u32` | EMA weight shift |
+| `wear_bias` | `u32` | Wear penalty factor |
+
+### struct tv_io_stats (tieredvol.h:60-70)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `in_flight_bytes[16]` | `atomic_t` | Per-disk in-flight bytes |
+| `total_write_bytes[16]` | `u64` | Per-disk total write bytes |
+| `total_read_bytes[16]` | `u64` | Per-disk total read bytes |
+| `total_write_ops[16]` | `u64` | Per-disk total write ops |
+| `total_read_ops[16]` | `u64` | Per-disk total read ops |
+| `total_latency_ns[16]` | `u64` | Per-disk accumulated latency (ns) |
+| `total_completions[16]` | `u64` | Per-disk accumulated completions |
+| `interval_completions[16]` | `u64` | Per-disk interval completions |
+
+### struct tv_adaptive_state (tieredvol.h:72-86)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ema_weight_shift` | `u32` | EMA alpha shift (0-10) |
+| `ema_load[16]` | `s64` | Per-disk EMA load score |
+| `stale_after_ns` | `u64` | Stale timeout (ns) |
+| `stale[16]` | `bool` | Per-disk stale flag |
+| `stale_marked_ns[16]` | `ktime_t` | Per-disk stale marked time |
+| `grace_until_ns[16]` | `ktime_t` | Per-disk grace period deadline |
+| `last_finish_ns[16]` | `ktime_t` | Per-disk last I/O completion time |
+| `decay_timer` | `struct timer_list` | EMA decay timer |
+| `wear_bias` | `u32` | Wear penalty factor |
+| `policy` | `int` | Current dispatch policy |
+| `ema_latency_ns[16]` | `s64` | Per-disk EMA latency (ns) |
+| `ema_iops[16]` | `s64` | Per-disk EMA IOPS |
+
+### struct tieredvol_ctx (tieredvol.h:111-129)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ti` | `struct dm_target *` | DM target pointer |
+| `meta` | `struct tieredvol_metadata *` | Metadata |
+| `devs` | `struct dm_dev **` | DM device array |
+| `disk_sectors` | `sector_t *` | Per-disk sector count |
+| `config_path` | `char *` | Config file path |
+| `ndisks` | `u32` | Number of disks |
+| `min_chunk_sectors` | `sector_t` | Minimum chunk (sectors) |
+| `stripe_sectors` | `sector_t` | Stripe size (sectors) |
+| `io` | `struct tv_io_stats` | I/O statistics |
+| `deg` | `struct tv_degradation` | Degradation state |
+| `adaptive` | `struct tv_adaptive_state` | Adaptive state |
+| `mirror` | `struct tv_mirror_stats` | Mirror statistics |
+| `rebuild` | `struct tv_rebuild_state` | Rebuild state |
+| `mirror_enabled_any` | `bool` | Any segment mirror enabled |
+| `trigger_event` | `struct work_struct` | Event trigger work |
+| `mirror_pw_pool` | `mempool_t *` | Mirror bio mempool |
+| `retry_ctx_pool` | `mempool_t *` | Retry context mempool |
+
+### struct tv_pending_read_cpu / tv_pending_write_cpu (tieredvol.h:196-213)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `entries[64]` | `struct bio *` | Pending bio array |
+| `head` | `u32` | Ring index head |
+| `count` | `u32` | Current pending count |
 
 ---
 
 ## 1. I/O Dispatch
 
-The I/O dispatch layer translates logical byte offsets into physical disk assignments. TieredVol supports three dispatch policies, each selecting a disk within the appropriate segment and computing the physical sector offset.
+The I/O dispatch layer translates logical byte offsets into physical disk assignments. TieredVol supports three dispatch policies, each selecting a disk within the appropriate segment and computing the physical sector offset. Dispatch is implemented in `tieredvol_map.c`, with the main entry point in `tieredvol_core.c`.
 
 ### #1 Static Weighted Dispatch
 
-> Deterministically maps logical offsets to disks using pre-computed weighted stripe boundaries.
+> Deterministically maps logical offsets to disks based on precomputed weighted stripe boundaries.
 
-**Implementation:** `tv_map_logical()` in `driver/tieredvol_map.c:4-65`. Builds a prefix-sum boundary array from segment weights, then performs a linear scan to locate the target disk. Physical offset is computed as `stripe_no * weight[disk] * CHUNK_SIZE + (offset_in - boundary[disk])`.
+**Implementation:** `tv_map_logical()`, located in `tieredvol_map.c:4-65`. Constructs prefix-sum boundary arrays from segment weights and performs linear scan to locate the target disk. Physical offset formula: `stripe_no * weight[disk] * CHUNK_SIZE + (offset_in - boundary[disk])`.
 
-**Core APIs:** `bio_set_dev()`, `bdev_nr_sectors()`
+**Key APIs:** `bio_set_dev()`, `bdev_nr_sectors()`
 
 **References:**
-1. `drivers/md/dm-stripe.c` — Classic striped target with weighted distribution
-2. `drivers/md/dm-switch.c` — Region-based bio dispatch with sector remapping
+1. `drivers/md/dm-stripe.c` — classic striped target with weighted allocation
+2. `drivers/md/dm-switch.c` — region-based bio dispatch and sector remapping
 
 ---
 
-### #2 Adaptive EMA Dispatch
+### #2 Adaptive Multi-Factor Dispatch
 
-> Selects the least-loaded disk per bio using an Exponential Moving Average load score with wear penalty, automatically skipping stale disks.
+> Uses multi-factor scoring (EMA load + EMA latency + wear penalty) to select the optimal disk per bio, automatically skipping stale disks.
 
-**Implementation:** `tv_map_logical_adaptive()` in `driver/tieredvol_map.c:67-156`. Iterates candidate disks, computes `load = ema_load[d] + wear_bias * total_write_bytes[d] / total_writes`, and picks the minimum. Falls back to any valid disk if all candidates are stale.
+**Implementation:** `tv_map_logical_adaptive()`, located in `tieredvol_map.c:132-149`. Scoring formula:
 
-**Core APIs:** `get_random_u32()`, atomic EMA update via `tv_decay_timer_fn()`
+```
+score = ema_load[d] + ema_latency_ns[d] / 1000000 + wear_bias * total_write_bytes[d] / total_writes
+```
+
+Iterates candidate disks, selects minimum score. If all candidates are stale, falls back to any valid disk. The EMA latency term is in microseconds (divides ns by 1000000) to match the load factor's order of magnitude.
+
+**Key APIs:** `get_random_u32()`, atomic EMA updates (`tv_decay_timer_fn()`)
 
 **References:**
-1. `block/kyber-iosched.c` — Token-based dynamic depth adjustment
-2. `block/mq-deadline.c` — Request sorting with time-based expiry
+1. Jiao & Kim, "Asymmetric RAID: Rethinking RAID for SSD Heterogeneity" — HotStorage'24
+2. `block/kyber-iosched.c` — token-based dynamic depth
+3. `block/mq-deadline.c` — request sorting and time-based expiry
 
 ---
 
 ### #3 Random Dispatch
 
-> Selects a disk uniformly at random within the segment.
+> Uniformly selects a random disk within the segment.
 
-**Implementation:** `tv_map_logical_random()` in `driver/tieredvol_map.c:158-201`. Uses `get_random_u32() % seg->disk_count` for uniform selection.
+**Implementation:** `tv_map_logical_random()`, located in `tieredvol_map.c:158-201`. Uses `get_random_u32() % seg->disk_count` for uniform selection.
 
-**Core APIs:** `get_random_u32()`
+**Key APIs:** `get_random_u32()`
 
 **References:**
-1. `drivers/md/dm-switch.c` — Random path selection fallback
+1. `drivers/md/dm-switch.c` — random path selection fallback
 
 ---
 
 ### #4 Bio Sector Remapping
 
-> Redirects a bio from the DM virtual device to the correct physical disk by rewriting `bi_bdev` and `bi_iter.bi_sector`.
+> Redirects bio from DM virtual device to correct physical disk by rewriting `bi_bdev` and `bi_iter.bi_sector`.
 
-**Implementation:** `tieredvol_map()` in `driver/tieredvol_core.c:156-238`. Calls `bio_set_dev(bio, ctx->devs[cur.disk]->bdev)` and sets `bio->bi_iter.bi_sector = cur.offset >> SECTOR_SHIFT`.
+**Implementation:** `tieredvol_map()`, located in `tieredvol_core.c:33-164`. Calls `bio_set_dev(bio, ctx->devs[cur.disk]->bdev)` and sets `bio->bi_iter.bi_sector = cur.offset >> SECTOR_SHIFT`.
 
-**Core APIs:** `bio_set_dev()`, `SECTOR_SHIFT`
+**Key APIs:** `bio_set_dev()`, `SECTOR_SHIFT`
 
 **References:**
-1. `drivers/md/dm-crypt.c` — Bio clone + redirect to encryption layer
-2. `drivers/md/dm-linear.c` — Simplest bio remapping target
+1. `drivers/md/dm-crypt.c` — bio clone + redirect to encryption layer
+2. `drivers/md/dm-linear.c` — simplest bio remap target
 
 ---
 
 ### #5 Invalid Disk Error
 
-> Returns a bio error when the computed disk index is out of range.
+> Returns bio error when computed disk index is out of range.
 
-**Implementation:** `tieredvol_map()` at `driver/tieredvol_core.c:182-189`. Checks `cur.disk < 0 || cur.disk >= ctx->ndisks`, then calls `bio_io_error(bio)` and returns `DM_MAPIO_SUBMITTED`.
+**Implementation:** `tieredvol_map()`, located in `tieredvol_core.c:89-96`. Checks `cur.disk < 0 || cur.disk >= ctx->ndisks`, calls `bio_io_error(bio)` and returns `DM_MAPIO_SUBMITTED`.
 
-**Core APIs:** `bio_io_error()`
+**Key APIs:** `bio_io_error()`
 
 **References:**
-1. `drivers/md/dm.c` — DM core error handling patterns
+1. `drivers/md/dm.c` — DM core error handling
 
 ---
 
 ### #6 Write Mirroring
 
-> Clones a write bio and submits the clone to a designated mirror disk for data redundancy.
+> Clones write bio and submits to designated mirror disk for data redundancy.
 
-**Implementation:** `tieredvol_map()` at `driver/tieredvol_core.c:206-234`. When `seg->mirror_enabled` and the mirror disk differs from the primary, calls `bio_alloc_clone()` with `&fs_bio_set`, sets a custom `tv_mirror_end_io` completion handler, and submits via `submit_bio()`.
+**Implementation:** `tieredvol_map()`, located in `tieredvol_core.c:126-160`. When `seg->mirror_enabled` and mirror disk differs from primary, allocates clone bio from `ctx->mirror_pw_pool` (`mempool_alloc()`), sets custom `tv_mirror_end_io` completion handler, submits via `submit_bio()`. Mempool ensures zero OOM.
 
-**Core APIs:** `bio_alloc_clone()`, `submit_bio()`, `bio_put()`
+**Key APIs:** `bio_alloc_clone()`, `submit_bio()`, `bio_put()`, `mempool_alloc()`
 
 **References:**
-1. `drivers/md/dm-raid1.c` — Bio clone + dual-disk write + custom bi_end_io
+1. `drivers/md/dm-raid1.c` — bio clone + dual disk write + custom bi_end_io
 
 ---
 
-## 2. Load Balancing + Time Decay
+## 2. Load Balancing + Adaptive Decay
 
-Load balancing tracks per-disk I/O pressure using in-flight byte counters and an EMA smoothing filter. A 1-second hardware timer periodically decays these counters, providing a smoothed load estimate for the adaptive dispatch policy.
+Load balancing uses in-flight byte counters and triple EMA smoothing (load, IOPS, latency) to track per-disk I/O pressure. A hardware timer decays these counters at an adaptive interval, providing smooth disk state estimates for the multi-factor adaptive dispatch.
 
 ### #7 EMA Load Calculation
 
-> Computes per-disk load using an Exponential Moving Average: `ema = ema * (1 - alpha) + snapshot * alpha`, where alpha is configurable via `ema_weight_shift`.
+> Computes per-disk load via exponential moving average: `ema = ema * (1 - alpha) + snapshot * alpha`, alpha tunable via `ema_weight_shift`.
 
-**Implementation:** `tv_decay_timer_fn()` in `driver/tieredvol_core.c:92-142`. Alpha defaults to `1 << 3 = 8` out of 1024 (shift=3). The snapshot is the atomic in-flight byte counter, reset to zero each tick via `atomic_xchg()`.
+**Implementation:** `tv_decay_timer_fn()`, located in `tieredvol_log.c:81-83`. Default alpha = `1 << 3 = 8` (full value 1024, shift=3). Snapshot is atomic in-flight byte counter, zeroed each tick via `atomic_xchg()`.
 
-**Core APIs:** `timer_list`, `atomic_xchg()`
+**Key APIs:** `timer_list`, `atomic_xchg()`
 
 **References:**
 1. `kernel/sched/fair.c` — CFS per-CPU load tracking
-2. `drivers/md/dm-thin.c` — Pool mode switching with low watermark callback
+2. `drivers/md/dm-thin.c` — pool mode switching and low watermark callback
 
 ---
 
-### #8 In-flight Byte Tracking
+### #8 EMA IOPS Calculation
 
-> Counts bytes currently in transit to each disk using per-disk atomic counters.
+> Tracks per-disk completed IOPS via EMA, smoothing burst traffic.
 
-**Implementation:** `tieredvol_map()` at `driver/tieredvol_core.c:193` increments `atomic_add(bio->bi_iter.bi_size, &ctx->in_flight_bytes[cur.disk])`. The decay timer resets counters to zero each second via `atomic_xchg()`.
+**Implementation:** `tv_decay_timer_fn()`, located in `tieredvol_log.c:86-88`. Snapshot is atomic `interval_completions` counter, zeroed each tick via `atomic_xchg()` before EMA update.
 
-**Core APIs:** `atomic_add()`, `atomic_xchg()`
+**Key APIs:** `atomic_xchg()`
+
+---
+
+### #9 EMA Latency Measurement
+
+> Tracks per-disk I/O latency via EMA, combined with timestamp ring for lockless measurement.
+
+**Implementation:** `tv_decay_timer_fn()`, located in `tieredvol_log.c:91-102`. Computes interval average latency from `total_latency_ns` and `total_completions`, updates `ema_latency_ns[d]`. Timestamp ring (`tv_ts_ring`) implements lockless latency tracking in `tieredvol_mirror.c:155-219`: `tv_ts_submit()` (:170-188) records submission time, `tv_ts_complete()` (:190-219) computes completion time delta.
+
+**Key APIs:** `ktime_get_boottime_ns()`
+
+---
+
+### #10 In-flight Byte Tracking
+
+> Counts bytes currently in transit using per-disk atomic counters.
+
+**Implementation:** `tieredvol_map()`, located in `tieredvol_core.c:109`. `atomic_add(bio->bi_iter.bi_size, &ctx->io.in_flight_bytes[cur.disk])`. Decay timer zeroes via `atomic_xchg()`.
+
+**Key APIs:** `atomic_add()`, `atomic_xchg()`
 
 **References:**
 1. `block/blk-mq.c` — blk-mq per-tag statistics
 
 ---
 
-### #9 1-second Decay Timer
+### #11 Adaptive Decay Timer Interval
 
-> Fires a hardware timer every HZ ticks to decay load counters and check stale detection.
+> Timer interval adapts dynamically based on I/O activity: 100ms when busy, 1s when idle.
 
-**Implementation:** `timer_setup(&ctx->decay_timer, tv_decay_timer_fn, 0)` at `driver/tieredvol_core.c:317-318`. The timer re-arms itself at the end of each tick via `mod_timer()`.
+**Implementation:** `tv_decay_timer_fn()`, located in `tieredvol_log.c:143-145`. If any completions occurred in the interval (`total_completions[d] > 0`), uses `TV_DECAY_FAST = HZ/10` (100ms); otherwise `TV_DECAY_SLOW = HZ` (1s). Rearmed via `mod_timer()`.
 
-**Core APIs:** `timer_setup()`, `mod_timer()`, `timer_delete_sync()`
-
-**References:**
-1. `kernel/time/timer_list.c` — timer_list API reference
-
----
-
-### #10 Wear-bias Penalty
-
-> Adds a write-amplification penalty to the load score: `load += wear_bias * total_write_bytes[d] / total_writes`.
-
-**Implementation:** `tv_map_logical_adaptive()` at `driver/tieredvol_map.c:106-122`. When `wear_bias > 0`, each disk's load is penalized proportional to its share of total writes, discouraging further writes to heavily-worn disks.
-
-**Core APIs:** None (pure arithmetic)
+**Key APIs:** `mod_timer()`
 
 **References:**
-1. `block/mq-deadline.c` — Write penalty heuristics
+1. `kernel/time/timer_list.c` — timer_list API
 
 ---
 
 ## 3. Stale Disk Detection + Recovery
 
-Stale detection identifies disks that have stopped responding to I/O. A disk is marked stale after a configurable timeout, then automatically recovered when I/O resumes or after a cooldown period. A grace period prevents immediate re-staling after recovery.
+Stale detection identifies disks that have stopped responding to I/O. Disks are marked stale after a configurable timeout, then automatically recover on new I/O or after cooldown. Recovery grace period prevents immediate re-marking.
 
-### #11 Stale Marking
+### #12 Stale Marking
 
-> Marks a disk as stale when no I/O completes within `stale_after_ns` (default 5 seconds).
+> Marks disk stale when no I/O completion occurs within `stale_after_ns` (default 5 seconds).
 
-**Implementation:** `tv_decay_timer_fn()` at `driver/tieredvol_core.c:112-123`. Checks `now > ctx->grace_until_ns[i]` and `(now - ctx->last_finish_ns[i]) > ctx->stale_after_ns`. Sets `ctx->stale[i] = true` and logs via `tv_log(TV_LOG_WARN, ...)`.
+**Implementation:** `tv_decay_timer_fn()`, located in `tieredvol_log.c:112-123`. Checks `now > ctx->adaptive.grace_until_ns[i]` and `(now - ctx->adaptive.last_finish_ns[i]) > ctx->adaptive.stale_after_ns`. Sets `ctx->adaptive.stale[i] = true` and logs via `tv_log(TV_LOG_WARN, ...)`.
 
-**Core APIs:** `ktime_get_boottime_ns()`
-
-**References:**
-1. `drivers/md/dm-dust.c` — Bad block simulation with enable/disable
-2. `drivers/md/dm-raid1.c` — Mirror failover + error detection
-
----
-
-### #12 Stale Recovery (I/O Triggered)
-
-> Immediately recovers a stale disk when new I/O completes on it, and starts a new grace period.
-
-**Implementation:** `tv_decay_timer_fn()` at `driver/tieredvol_core.c:124-129`. When `ctx->stale[i] && snapshot > 0`, sets `stale[i] = false` and `grace_until_ns[i] = now + stale_after_ns`.
-
-**Core APIs:** None (state machine)
+**Key APIs:** `ktime_get_boottime_ns()`
 
 **References:**
-1. `drivers/md/dm-log.c` — Dirty region tracking with recovery
+1. `drivers/md/dm-dust.c` — bad block simulation and enable/disable
+2. `drivers/md/dm-raid1.c` — mirror failover and error detection
 
 ---
 
-### #13 Stale Recovery (Cooldown)
+### #13 Stale Recovery — I/O Triggered
 
-> Automatically recovers a stale disk after 2x the stale timeout, even without new I/O.
+> Immediately recovers stale disk when new I/O completes, starting a new grace period.
 
-**Implementation:** `tv_decay_timer_fn()` at `driver/tieredvol_core.c:130-138`. When `(now - ctx->stale_marked_ns[i]) > 2 * ctx->stale_after_ns`, sets `stale[i] = false`.
+**Implementation:** `tv_decay_timer_fn()`, located in `tieredvol_log.c:124-129`. When `ctx->adaptive.stale[i] && snapshot > 0`, sets `stale[i] = false` and `grace_until_ns[i] = now + stale_after_ns`.
 
-**Core APIs:** None (state machine)
+**Key APIs:** None (state machine)
 
 **References:**
-1. `block/disk-events.c` — Disk event polling with timeout
+1. `drivers/md/dm-log.c` — dirty region tracking and recovery
 
 ---
 
-### #14 Grace Period
+### #14 Stale Recovery — Cooldown
 
-> Protects a newly-recovered disk from being immediately re-marked stale.
+> Automatically recovers stale disk after 2x stale timeout, even without new I/O.
 
-**Implementation:** `tv_decay_timer_fn()` at `driver/tieredvol_core.c:126,134`. Sets `ctx->grace_until_ns[i] = now + ctx->stale_after_ns` on recovery. The stale check at line 115 verifies `now > ctx->grace_until_ns[i]` before marking stale.
+**Implementation:** `tv_decay_timer_fn()`, located in `tieredvol_log.c:130-138`. When `(now - ctx->adaptive.stale_marked_ns[i]) > 2 * ctx->adaptive.stale_after_ns`, sets `stale[i] = false`.
 
-**Core APIs:** None (state machine)
+**Key APIs:** None (state machine)
 
 **References:**
-1. `drivers/md/dm-raid1.c` — Mirror recovery grace period
+1. `block/disk-events.c` — disk event polling and timeout
 
 ---
 
-## 4. Per-Disk I/O Statistics
+### #15 Grace Period
 
-Cumulative counters for each physical disk, tracked across the lifetime of the device-mapper target.
+> Protects newly recovered disks from immediate re-marking as stale.
 
-### #15 Read Bytes Counter
+**Implementation:** `tv_decay_timer_fn()`, located in `tieredvol_log.c:126,134`. On recovery, sets `ctx->adaptive.grace_until_ns[i] = now + ctx->adaptive.stale_after_ns`. Line 115 stale check verifies `now > ctx->adaptive.grace_until_ns[i]` before marking stale.
 
-> Total bytes read from each disk.
+**Key APIs:** None (state machine)
 
-**Implementation:** `ctx->total_read_bytes[cur.disk] += bio->bi_iter.bi_size` at `driver/tieredvol_core.c:198`.
-
-**References:** `drivers/md/dm.c` — DM core bio stats
+**References:**
+1. `drivers/md/dm-raid1.c` — mirror recovery grace period
 
 ---
 
-### #16 Read Ops Counter
+## 4. Per-disk I/O Statistics
+
+Cumulative counters per physical disk, tracked throughout the device-mapper target's lifetime. Stored in `struct tv_io_stats`.
+
+### #16 Read Bytes Counter
+
+> Total bytes read per disk.
+
+**Implementation:** `ctx->io.total_read_bytes[cur.disk] += bio->bi_iter.bi_size`, located in `tieredvol_core.c:114`.
+
+**References:** `drivers/md/dm.c` — DM core bio statistics
+
+---
+
+### #17 Read Ops Counter
 
 > Total read operations per disk.
 
-**Implementation:** `ctx->total_read_ops[cur.disk]++` at `driver/tieredvol_core.c:199`.
+**Implementation:** `ctx->io.total_read_ops[cur.disk]++`, located in `tieredvol_core.c:115`.
 
-**References:** `block/blk-mq.c` — blk-mq per-tag stats
-
----
-
-### #17 Write Bytes Counter
-
-> Total bytes written to each disk.
-
-**Implementation:** `ctx->total_write_bytes[cur.disk] += bio->bi_iter.bi_size` at `driver/tieredvol_core.c:195`.
-
-**References:** `drivers/nvme/host/core.c` — NVMe per-controller stats
+**References:** `block/blk-mq.c` — blk-mq per-tag statistics
 
 ---
 
-### #18 Write Ops Counter
+### #18 Write Bytes Counter
+
+> Total bytes written per disk.
+
+**Implementation:** `ctx->io.total_write_bytes[cur.disk] += bio->bi_iter.bi_size`, located in `tieredvol_core.c:111`.
+
+**References:** `drivers/nvme/host/core.c` — NVMe per-controller statistics
+
+---
+
+### #19 Write Ops Counter
 
 > Total write operations per disk.
 
-**Implementation:** `ctx->total_write_ops[cur.disk]++` at `driver/tieredvol_core.c:196`.
+**Implementation:** `ctx->io.total_write_ops[cur.disk]++`, located in `tieredvol_core.c:112`.
 
-**References:** `block/genhd.c` — `part_stat_show` per-partition stats
+**References:** `block/genhd.c` — `part_stat_show` per-partition statistics
 
 ---
 
-### #19 Error Counter
+### #20 Error Counter
 
-> Atomic error count per disk, incremented on bio completion errors.
+> Per-disk atomic error count, incremented on bio completion errors.
 
-**Implementation:** `ctx->error_count[disk]` is an `atomic_t` array allocated in `tieredvol_ctr()` at `driver/tieredvol_core.c:299`. Read via `atomic_read()` in `tieredvol_status()`.
+**Implementation:** `ctx->error_count[disk]` is an `atomic_t` array, allocated in `tieredvol_ctr()`. Read via `atomic_read()` in `tieredvol_status()` and degradation detection.
 
-**Core APIs:** `atomic_read()`, `atomic_set()`
+**Key APIs:** `atomic_read()`, `atomic_set()`, `atomic_inc()`
 
 **References:**
 1. `drivers/md/dm.c` — DM error counting
-2. `drivers/md/dm-raid1.c` — Mirror error tracking
+2. `drivers/md/dm-raid1.c` — mirror error tracking
 
 ---
 
-## 5. Per-CPU Global Statistics
+## 5. DM Message Commands
 
-Lock-free global counters using `DEFINE_PER_CPU` for high-throughput I/O tracking without cache-line contention.
+Runtime control interface via `dmsetup message`. All commands dispatched in `tv_message()` (`tieredvol_message.c`, 27 handlers).
 
-### #20 Per-CPU Map Count
+### #21 `reset_stats` (Command 0)
 
-> Counts total bio mapping operations across all CPUs.
+> Clears all per-disk I/O statistics (ops, bytes, latency, completion counts).
 
-**Implementation:** `DEFINE_PER_CPU(u64, tv_map_count)` at `driver/tieredvol_core.c:25`. Incremented via `this_cpu_inc(tv_map_count)` at line 201.
-
-**Core APIs:** `this_cpu_inc()`, `DEFINE_PER_CPU()`
-
-**References:**
-1. `include/linux/percpu_counter.h` — percpu_counter API
+**Implementation:** `tieredvol_message.c`. Zeros all 7 counter arrays in `tv_io_stats`.
 
 ---
 
-### #21 Per-CPU Sector Count
-
-> Counts total sectors dispatched across all CPUs.
-
-**Implementation:** `DEFINE_PER_CPU(u64, tv_map_sectors)` at `driver/tieredvol_core.c:26`. Accumulated via `this_cpu_add(tv_map_sectors, bio_sectors(bio))` at line 202.
-
-**Core APIs:** `this_cpu_add()`, `bio_sectors()`
-
-**References:**
-1. `kernel/sched/fair.c` — CFS per-CPU load tracking
-
----
-
-### #22 Per-CPU Byte Count
-
-> Counts total bytes dispatched across all CPUs.
-
-**Implementation:** `DEFINE_PER_CPU(u64, tv_map_bytes)` at `driver/tieredvol_core.c:27`. Accumulated via `this_cpu_add(tv_map_bytes, bio->bi_iter.bi_size)` at line 203.
-
-**Core APIs:** `this_cpu_add()`
-
-**References:**
-1. `include/linux/mm_types.h` — vm_stat per-CPU counters
-
----
-
-### #23 Cross-CPU Aggregation
-
-> Sums per-CPU counters across all possible CPUs for global totals.
-
-**Implementation:** `tv_read_count()`, `tv_read_sectors()`, `tv_read_bytes()` at `driver/tieredvol_core.c:63-88`. Each iterates `for_each_possible_cpu(cpu)` and sums `per_cpu(counter, cpu)`.
-
-**Core APIs:** `for_each_possible_cpu()`, `per_cpu()`
-
-**References:**
-1. `drivers/md/dm-thin.c` — Pool per-CPU deferred set
-
----
-
-## 6. DM Message Commands
-
-Runtime control interface via `dmsetup message`. Each command is dispatched in `tieredvol_message()` at `driver/tieredvol_core.c:520-808`.
-
-### #24 `reset_stats`
-
-> Zeros all per-CPU statistics (map count, sector count, byte count).
-
-**Implementation:** `driver/tieredvol_core.c:523-532`. Iterates `for_each_possible_cpu(cpu)` and sets each counter to 0.
-
----
-
-### #25 `show_stats`
-
-> Returns maps count, average bytes per map, and total bytes via dmesg.
-
-**Implementation:** `driver/tieredvol_core.c:533-542`. Computes `avg = total_bytes / maps_count`.
-
----
-
-### #26 `status`
-
-> Returns each disk name and its weight within its segment.
-
-**Implementation:** `driver/tieredvol_core.c:543-568`. Scans all segments to find the weight for each disk.
-
----
-
-### #27 `show_inflight`
-
-> Returns current in-flight bytes for each disk.
-
-**Implementation:** `driver/tieredvol_core.c:569-581`. Reads `atomic_read(&ctx->in_flight_bytes[i])`.
-
----
-
-### #28 `adaptive_on`
-
-> Switches dispatch policy to adaptive (EMA-based load balancing).
-
-**Implementation:** `driver/tieredvol_core.c:582-589`. Sets `ctx->policy = TV_POLICY_ADAPTIVE`.
-
----
-
-### #29 `adaptive_off`
-
-> Switches dispatch policy to static (weighted boundary-based).
-
-**Implementation:** `driver/tieredvol_core.c:590-597`. Sets `ctx->policy = TV_POLICY_STATIC`.
-
----
-
-### #30 `set_policy <name>`
-
-> Sets dispatch policy to static, adaptive, or random.
-
-**Implementation:** `driver/tieredvol_core.c:598-612`. Validates `argv[1]` against "static", "adaptive", "random".
-
----
-
-### #31 `set_ema_shift <shift>`
-
-> Sets EMA weight shift (0-10). Alpha = `1 << shift` out of 1024.
-
-**Implementation:** `driver/tieredvol_core.c:613-624`. Validates shift <= 10 via `kstrtou32()`. **Bug fixed:** originally checked `argc == 1` but read `argv[1]`, causing kernel oops. Fixed to `argc == 2`.
-
-**Core APIs:** `kstrtou32()`
-
----
-
-### #32 `set_stale_ms <ms>`
-
-> Sets stale detection timeout in milliseconds.
-
-**Implementation:** `driver/tieredvol_core.c:625-635`. Converts ms to ns: `ctx->stale_after_ns = (u64)ms * 1000000ULL`.
-
----
-
-### #33 `show_adaptive`
-
-> Returns policy, EMA shift, stale timeout, wear bias, and per-disk load/wear/stale status.
-
-**Implementation:** `driver/tieredvol_core.c:636-656`. Outputs a comprehensive status string.
-
----
-
-### #34 `show_wear`
-
-> Returns wear bias and per-disk total write bytes.
-
-**Implementation:** `driver/tieredvol_core.c:657-671`.
-
----
-
-### #35 `show_io_stats`
+### #22 `show_stats` (Command 1)
 
 > Returns per-disk read/write ops and bytes.
 
-**Implementation:** `driver/tieredvol_core.c:672-688`.
+**Implementation:** `tieredvol_message.c`. Outputs `total_read_ops/bytes` and `total_write_ops/bytes` per disk via `DMINFO()`.
 
 ---
 
-### #36 `reset_io_stats`
+### #23 `show_inflight` (Command 3)
 
-> Zeros all per-disk I/O statistics (read/write bytes/ops).
+> Returns per-disk in-flight bytes.
 
-**Implementation:** `driver/tieredvol_core.c:689-701`.
-
----
-
-### #37 `set_wear_bias <bias>`
-
-> Sets wear penalty factor (0-1024). Higher values penalize worn disks more in adaptive dispatch.
-
-**Implementation:** `driver/tieredvol_core.c:702-712`. Validates `bias <= 1024`.
+**Implementation:** `tieredvol_message.c`. Reads `atomic_read(&ctx->io.in_flight_bytes[i])`.
 
 ---
 
-### #38 `reset_wear`
+### #24 `show_io_stats` (Command 4)
 
-> Zeros per-disk write bytes (wear counters).
+> Returns full per-disk I/O statistics including latency and completion counts.
 
-**Implementation:** `driver/tieredvol_core.c:713-722`.
+**Implementation:** `tieredvol_message.c`. Outputs `total_write/read_bytes`, `total_write/read_ops`, `total_latency_ns`, `total_completions`.
 
 ---
 
-### #39 `show_mirror`
+### #25 `reset_io_stats` (Command 5)
+
+> Zeros all 7 per-disk I/O statistics counters.
+
+**Implementation:** `tieredvol_message.c`. Zeros `in_flight_bytes`, `total_write/read_bytes`, `total_write/read_ops`, `total_latency_ns`, `total_completions`, `interval_completions`.
+
+---
+
+### #26 `adaptive_on` (Command 6)
+
+> Switches dispatch policy to adaptive (multi-factor score-based load balancing).
+
+**Implementation:** `tieredvol_message.c`. Sets `ctx->adaptive.policy = TV_POLICY_ADAPTIVE`.
+
+---
+
+### #27 `adaptive_off` (Command 7)
+
+> Switches dispatch policy to static (weighted boundary-based).
+
+**Implementation:** `tieredvol_message.c`. Sets `ctx->adaptive.policy = TV_POLICY_STATIC`.
+
+---
+
+### #28 `set_policy <name>` (Command 8)
+
+> Sets dispatch policy to static, adaptive, or random.
+
+**Implementation:** `tieredvol_message.c`. Validates `argv[1]` is "static", "adaptive", or "random".
+
+---
+
+### #29 `set_ema_shift <shift>` (Command 9)
+
+> Sets EMA weight shift (0-10). Alpha = `1 << shift` (full value 1024).
+
+**Implementation:** `tieredvol_message.c`. Validates shift <= 10 via `kstrtou32()`.
+
+**Key APIs:** `kstrtou32()`
+
+---
+
+### #30 `set_stale_ms <ms>` (Command 10)
+
+> Sets stale detection timeout in milliseconds.
+
+**Implementation:** `tieredvol_message.c`. Converts to ns: `ctx->adaptive.stale_after_ns = (u64)ms * 1000000ULL`.
+
+---
+
+### #31 `show_adaptive` (Command 11)
+
+> Returns policy, EMA shift, stale timeout, wear bias, and per-disk load/latency/wear/stale status. Latency displayed in microseconds.
+
+**Implementation:** `tieredvol_message.c:304-327`. Output includes `lat=XXus` format latency field, converting `ema_latency_ns[d] / 1000000` to microseconds.
+
+---
+
+### #32 `show_wear` (Command 12)
+
+> Returns wear bias and per-disk total write bytes.
+
+**Implementation:** `tieredvol_message.c`. Outputs `wear_bias` and per-disk `total_write_bytes[d]`.
+
+---
+
+### #33 `set_wear_bias <bias>` (Command 13)
+
+> Sets wear penalty factor (0-1024). Higher values penalize high-wear disks more in adaptive dispatch.
+
+**Implementation:** `tieredvol_message.c`. Validates `bias <= 1024`.
+
+---
+
+### #34 `reset_wear` (Command 14)
+
+> Zeros per-disk write byte counters (wear counters).
+
+**Implementation:** `tieredvol_message.c`. Sets all `total_write_bytes[d]` to 0.
+
+---
+
+### #35 `show_mirror` (Command 15)
 
 > Returns mirror write ops/bytes, error count, and per-segment mirror configuration.
 
-**Implementation:** `driver/tieredvol_core.c:723-746`.
+**Implementation:** `tieredvol_message.c`. Outputs `mirror_stats` and segment mirror settings.
 
 ---
 
-### #40 `set_mirror <seg> <disk>`
+### #36 `set_mirror <seg> <disk>` (Command 16)
 
-> Enables mirroring for a segment, designating a target disk.
+> Enables mirroring for a segment, designating target disk.
 
-**Implementation:** `driver/tieredvol_core.c:747-763`. Validates `seg_idx < segment_count` and `disk_idx < ndisks`. Sets `seg->mirror_enabled = true` and `seg->mirror_disk = disk_idx`.
+**Implementation:** `tieredvol_message.c`. Validates `seg_idx < segment_count` and `disk_idx < ndisks`. Sets `seg->mirror_enabled = true` and `seg->mirror_disk = disk_idx`. Sets `ctx->mirror_enabled_any = true` (`tieredvol_mirror.c:398`).
 
 ---
 
-## 7. DM Target Lifecycle
+### #37 `show_log` (Command 17)
 
-Standard device-mapper target callbacks that manage the lifecycle of the tieredvol target.
+> Non-destructive log ring read: uses `kfifo_out()` + `kfifo_in()` to copy entries and restore, consuming nothing.
 
-### #41 Constructor (ctr)
+**Implementation:** `tieredvol_message.c:475-514`. Under spinlock, uses `kfifo_out()` to drain entries to temporary array, formats output, then writes back via `kfifo_in()` preserving original ring contents.
 
-> Allocates context, loads metadata from config file, acquires DM devices, and starts the decay timer.
+**Key APIs:** `kfifo_out()`, `kfifo_in()`, `spin_lock_irqsave()`
 
-**Implementation:** `tieredvol_ctr()` at `driver/tieredvol_core.c:246-408`. Flow:
-1. Parse args (expects 1 argument: config file path)
+---
+
+### #38 `clear_log` (Command 18)
+
+> Resets log ring buffer.
+
+**Implementation:** `tieredvol_message.c`. Calls `kfifo_reset()` under spinlock.
+
+---
+
+### #39 `set_loglevel <0-3>` (Command 19)
+
+> Sets log verbosity: OFF(0) / ERROR(1) / WARN(2) / INFO(3).
+
+**Implementation:** `tieredvol_message.c`. Sets global `tv_log_level`.
+
+---
+
+### #40 `show_errors` (Command 20)
+
+> Returns per-disk error count.
+
+**Implementation:** `tieredvol_message.c`. Reads via `atomic_read(&ctx->error_count[d])`.
+
+---
+
+### #41 `reset_errors` (Command 21)
+
+> Zeros all per-disk error counts.
+
+**Implementation:** `tieredvol_message.c`. Sets all `error_count[d]` to 0.
+
+---
+
+### #42 `set_error_threshold <n>` (Command 22)
+
+> Sets error threshold triggering degraded mode.
+
+**Implementation:** `tieredvol_message.c`. Sets `ctx->deg.error_threshold = n`.
+
+---
+
+### #43 `show_degraded` (Command 23)
+
+> Returns degraded mode status: whether degraded, trigger reason, error threshold.
+
+**Implementation:** `tieredvol_message.c`. Outputs `ctx->deg` state.
+
+---
+
+### #44 `clear_degraded` (Command 24)
+
+> Manually clears degraded mode flag.
+
+**Implementation:** `tieredvol_message.c`. Sets `ctx->deg.is_degraded = false`.
+
+---
+
+### #45 `start_rebuild [max_bytes]` (Command 25)
+
+> Starts background rebuild thread with optional max bytes per iteration.
+
+**Implementation:** `tieredvol_message.c`. Creates kthread `tv_rebuild_thread()` with exponential backoff retry. Returns error if already rebuilding. Optional `max_bytes` parameter limits per-iteration processing.
+
+---
+
+### #46 `stop_rebuild` (Command 26)
+
+> Stops background rebuild thread.
+
+**Implementation:** `tieredvol_message.c`. Sets stop flag and waits for kthread exit.
+
+---
+
+### #47 `show_rebuild` (Command 27)
+
+> Returns rebuild status: running/completed/stopped, bytes processed, total bytes.
+
+**Implementation:** `tieredvol_message.c`. Outputs `ctx->rebuild` state.
+
+---
+
+## 6. DM Target Lifecycle
+
+Standard device-mapper target callback functions managing the tieredvol target lifecycle.
+
+### #48 Constructor (ctr)
+
+> Allocates context, loads metadata from config file, acquires DM devices, allocates mempools, and starts decay timer.
+
+**Implementation:** `tieredvol_ctr()`, located in `tieredvol_core.c`. Flow:
+1. Parse arguments (expects 1: config file path)
 2. `kzalloc(sizeof(*ctx))` — allocate context
-3. `tv_metadata_load_kernel()` — parse key=value config file via `filp_open()` + `kernel_read()`
-4. `kcalloc(ndisks, sizeof(*ctx->devs))` — allocate device arrays
+3. `tv_metadata_load_kernel()` — parse key=value config via `filp_open()` + `kernel_read()`
+4. `kcalloc(ndisks, sizeof(*ctx->devs))` — allocate device array
 5. `dm_get_device()` — acquire each DM device
 6. Compute `min_chunk_sectors` across all segments
 7. `dm_set_target_max_io_len()` — set max I/O size
-8. `timer_setup()` + `mod_timer()` — start decay timer
+8. `mempool_create()` — create mirror_pw_pool and retry_ctx_pool
+9. `timer_setup()` + `mod_timer()` — start decay timer
 
-**Core APIs:** `kzalloc()`, `kcalloc()`, `dm_get_device()`, `dm_set_target_max_io_len()`, `timer_setup()`
+**Key APIs:** `kzalloc()`, `kcalloc()`, `dm_get_device()`, `dm_set_target_max_io_len()`, `timer_setup()`, `mempool_create()`
 
 ---
 
-### #42 Destructor (dtr)
+### #49 Destructor (dtr)
 
-> Stops the decay timer, flushes pending work, releases DM devices, and frees all memory.
+> Stops decay timer, stops rebuild thread, flushes pending work, releases DM devices, and frees all memory.
 
-**Implementation:** `tieredvol_dtr()` at `driver/tieredvol_core.c:410-425`. Flow:
+**Implementation:** `tieredvol_dtr()`, located in `tieredvol_core.c`. Flow:
 1. `timer_delete_sync()` — stop decay timer
-2. `flush_work()` — complete pending trigger_event work
-3. `dm_put_device()` — release each DM device
-4. `kfree()` — free all allocations
+2. `kthread_stop()` — stop rebuild thread (if running)
+3. `flush_work()` — complete pending trigger_event work
+4. `dm_put_device()` — release each DM device
+5. `mempool_destroy()` — destroy mempools
+6. `kfree()` — free all allocations
 
-**Core APIs:** `timer_delete_sync()`, `flush_work()`, `dm_put_device()`, `kfree()`
-
----
-
-### #43 IO Hints
-
-> Reports block size, chunk size, and optimal I/O size to the DM framework.
-
-**Implementation:** `tieredvol_io_hints()` at `driver/tieredvol_core.c:438-448`. Sets `logical_block_size = 512`, `physical_block_size = 512`, `chunk_sectors = min_chunk_sectors`, `io_opt = stripe_sectors`.
-
-**Core APIs:** `struct queue_limits`
+**Key APIs:** `timer_delete_sync()`, `kthread_stop()`, `flush_work()`, `dm_put_device()`, `mempool_destroy()`, `kfree()`
 
 ---
 
-### #44 Iterate Devices
+### #50 IO Hints
+
+> Reports chunk size, block size, and optimal I/O size to DM framework.
+
+**Implementation:** `tieredvol_io_hints()`, located in `tieredvol_core.c`. Sets `logical_block_size = 512`, `physical_block_size = 512`, `chunk_sectors = min_chunk_sectors`, `io_opt = stripe_sectors`.
+
+**Key APIs:** `struct queue_limits`
+
+---
+
+### #51 Iterate Devices
 
 > Returns all underlying DM devices for status reporting and ioctl passthrough.
 
-**Implementation:** `tieredvol_iterate_devices()` at `driver/tieredvol_core.c:450-463`. Iterates `ctx->devs[0..ndisks-1]` and calls the callback for each.
+**Implementation:** `tieredvol_iterate_devices()`, located in `tieredvol_core.c`. Iterates `ctx->devs[0..ndisks-1]`, calling callback for each device.
 
-**Core APIs:** `iterate_devices_callout_fn`, `bdev_nr_sectors()`
-
----
-
-### #45 Prepare Ioctl
-
-> Returns the first underlying device's block device for ioctl passthrough.
-
-**Implementation:** `tieredvol_prepare_ioctl()` at `driver/tieredvol_core.c:427-436`. Sets `*bdev = ctx->devs[0]->bdev`.
-
-**Core APIs:** `struct block_device`
+**Key APIs:** `iterate_devices_callout_fn`, `bdev_nr_sectors()`
 
 ---
 
-### #46 Flush/Discard Propagation
+### #52 Prepare Ioctl
+
+> Returns first underlying block device for ioctl passthrough.
+
+**Implementation:** `tieredvol_prepare_ioctl()`, located in `tieredvol_core.c`. Sets `*bdev = ctx->devs[0]->bdev`.
+
+**Key APIs:** `struct block_device`
+
+---
+
+### #53 Flush/Discard Propagation
 
 > Propagates flush and discard commands to all underlying disks.
 
-**Implementation:** `tieredvol_ctr()` at `driver/tieredvol_core.c:390-392`. Sets `ti->num_flush_bios = ctx->ndisks` and `ti->num_discard_bios = ctx->ndisks`. Also sets `ti->flush_bypasses_map = true`.
+**Implementation:** `tieredvol_ctr()`. Sets `ti->num_flush_bios = ctx->ndisks` and `ti->num_discard_bios = ctx->ndisks`. Also sets `ti->flush_bypasses_map = true`.
 
 ---
 
-### #47 Module Init/Exit
+### #54 Module Init/Exit
 
-> Registers the DM target with the kernel and creates a workqueue.
+> Registers DM target with kernel and creates workqueue.
 
-**Implementation:** `tieredvol_init()` at `driver/tieredvol_core.c:828-847`. Calls `dm_register_target()` and `alloc_workqueue("tieredvol_wq", WQ_UNBOUND | WQ_HIGHPRI, 0)`. Exit calls `dm_unregister_target()` and `destroy_workqueue()`.
+**Implementation:** `tieredvol_init()`, located in `tieredvol_core.c:534-577`. Calls `dm_register_target()` and `alloc_workqueue("tieredvol_wq", WQ_UNBOUND | WQ_HIGHPRI, 0)`. Exit calls `dm_unregister_target()` and `destroy_workqueue()`.
 
-**Core APIs:** `dm_register_target()`, `dm_unregister_target()`, `alloc_workqueue()`
-
----
-
-## 8. Status Reporting
-
-Status output via `dmsetup status`, providing runtime visibility into the target's state.
-
-### #48 STATUSTYPE_INFO
-
-> Returns policy, mirror stats, error count, and per-disk active/degraded status with read/write counters.
-
-**Implementation:** `tieredvol_status()` at `driver/tieredvol_core.c:465-518` (STATUSTYPE_INFO case). Format: `policy=N mirror=ops/bytes err=N Ddisk:rd=ops/bytes wr=ops/bytes`.
+**Key APIs:** `dm_register_target()`, `dm_unregister_target()`, `alloc_workqueue()`
 
 ---
 
-### #49 STATUSTYPE_TABLE
+## 7. Status Reporting
 
-> Returns the list of underlying disk device names.
+Runtime visibility via `dmsetup status` output, providing target operational status.
 
-**Implementation:** `driver/tieredvol_core.c:500-513` (STATUSTYPE_TABLE case). Space-separated disk names.
+### #55 STATUSTYPE_INFO
+
+> Returns policy, mirror stats, error counts, and per-disk active/degraded and read/write counters. Includes `status` message command disk names and weights.
+
+**Implementation:** `tieredvol_status()`, located in `tieredvol_core.c` (STATUSTYPE_INFO case). Format: `policy=N mirror=ops/bytes err=N Ddisk:rd=ops/bytes wr=ops/bytes`.
 
 ---
 
-### #50 STATUSTYPE_IMA
+### #56 STATUSTYPE_TABLE
+
+> Returns list of underlying disk device names.
+
+**Implementation:** `tieredvol_core.c` (STATUSTYPE_TABLE case). Space-separated disk names.
+
+---
+
+### #57 STATUSTYPE_IMA
 
 > IMA (Integrity Measurement Architecture) placeholder — returns empty string.
 
-**Implementation:** `driver/tieredvol_core.c:514-516`. Sets `result[0] = '\0'`.
+**Implementation:** `tieredvol_core.c`. Sets `result[0] = '\0'`.
 
 ---
 
-## 9. Metadata Parsing
+## 8. Metadata Parsing
 
-Kernel-space configuration file parser that loads the tieredvol topology from a key=value text file.
+Kernel-space config file parser loading tieredvol topology from key=value text file. v5.0 adds CRC32C checksum and non-destructive pre-scan.
 
-### #51 Kernel File-based Config
+### #58 Kernel File-based Config
 
-> Reads a configuration file from kernel space using `filp_open()` + `kernel_read()`.
+> Reads config file from kernel space using `filp_open()` + `kernel_read()`.
 
-**Implementation:** `tv_metadata_load_kernel()` in `driver/tieredvol_meta.c:93-272`. Opens the file with `filp_open(path, O_RDONLY, 0)`, reads up to 1MB via `kernel_read()`, then parses line by line.
+**Implementation:** `tv_metadata_load_kernel()`, located in `tieredvol_meta.c`. Opens file with `filp_open(path, O_RDONLY, 0)`, reads up to 1MB via `kernel_read()`, then parses line by line.
 
-**Core APIs:** `filp_open()`, `kernel_read()`, `i_size_read()`, `vmalloc()`, `vfree()`
+**Key APIs:** `filp_open()`, `kernel_read()`, `i_size_read()`, `vmalloc()`, `vfree()`
 
 **References:**
-1. `drivers/md/dm-thin-metadata.c` — Complex metadata management (B-tree + superblock)
-2. `drivers/md/dm-log.c` — Disk log state persistence
+1. `drivers/md/dm-thin-metadata.c` — complex metadata management (B-tree + superblock)
+2. `drivers/md/dm-log.c` — disk log state persistence
 
 ---
 
-### #52 Version/Chunk/Segment/Disk Parsing
+### #59 Version/Chunk/Segment/Disk Parsing
 
-> Parses and validates version, chunk_size, segment_count, disk_count, and disk names.
+> Parses and validates version, chunk_size, segment_count, disk_count, disk names, segment disk indices/weight CSV, and mirror safety.
 
-**Implementation:** `driver/tieredvol_meta.c:150-187`. Uses `parse_u32()` / `parse_u64()` helpers. Validates `disk_count <= TV_MAX_DISKS` and `segment_count <= TV_MAX_SEGS`.
+**Implementation:** `tieredvol_meta.c:150-187`. Uses `parse_u32()` / `parse_u64()` helpers. Validates `disk_count <= TV_MAX_DISKS` and `segment_count <= TV_MAX_SEGS`. Parses comma-separated u32 arrays via `parse_csv_u32()` (:54-70). Mirror safety validation (:377-387) ensures `mirror_disk < disk_count` and mirror disk differs from primary disk.
 
-**Core APIs:** `kstrtoul()`, `kstrtoull()`
-
----
-
-### #53 Segment Disks/Weight CSV Parsing
-
-> Parses comma-separated u32 arrays for segment disk indices and weights.
-
-**Implementation:** `parse_csv_u32()` in `driver/tieredvol_meta.c:54-70`. Uses `strsep(&s, ",")` to tokenize. Also parses `seg_begin`, `seg_end`, `seg_stripe`, `seg_mirror` via `parse_num_prefix()`.
-
-**Core APIs:** `strsep()`, `parse_num_prefix()`
+**Key APIs:** `kstrtoul()`, `kstrtoull()`, `strsep()`
 
 **References:**
-1. `fs/configfs/configfs.c` — Kernel-userspace config interface
+1. `fs/configfs/configfs.c` — kernel-userspace config interface
 2. `drivers/md/dm-table.c` — DM table parsing
 
 ---
 
-## 10. ~~Hot-plug + Dynamic Detection~~ **[ABANDONED]**
+### #60 CRC32C Validation
 
-> **Status: Abandoned.** Not needed for research version. Too complex (DM table reload + metadata rebuild), ROI does not meet research project requirements.
+> CRC32C integrity check on config content, supporting non-destructive pre-scan.
 
-### #54 Online Add
+**Implementation:** `tv_compute_config_crc()`, located in `tieredvol_meta.c:98-133`. Computes `crc32c(0, config_start, config_len)`. CRC pre-scan (:183-219) locates CRC section before parsing, using `save_nl`/`restore_nl` and `save_eq`/`restore_eq` to save/restore parse state, avoiding destructive modification of original config string.
 
-> Dynamically expand a segment when a new disk is added.
-
-**Planned approach:** `dmsetup suspend` → rebuild metadata → `dmsetup resume`. Reference: `mdadm/Grow_Add_device()`.
-
-**References:**
-1. `mdadm/Grow.c` — Linear array hot-add (`Grow_Add_device`)
-2. `drivers/md/dm.c` — DM device dynamic creation (`dev_create`)
+**Key APIs:** `crc32c()`
 
 ---
 
-### #55 Online Remove
+## 9. Structured Diagnostic Log
 
-> Migrate stripe data before removing a disk.
+Kernel-space ring buffer logging I/O, stale, mirror, and config events with timestamps and severity levels. Queried via `dmsetup message`. v5.0 uses `raw_spinlock` instead of `spinlock`.
 
-**Planned approach:** Kernel thread copies data from source disk to surviving disks, then DM table reload. Reference: `mdadm --remove`.
+### #61 Ring Buffer
 
-**References:**
-1. `mdadm/Grow.c` — Online remove with data migration
+> Fixed-size `kfifo` ring buffer (512 entries) with `raw_spinlock` protection, recording timestamped log entries.
 
----
+**Implementation:** `tieredvol_log.c:27`. `DECLARE_KFIFO(tv_log_fifo, struct tv_log_entry, TV_LOG_SIZE)` with `raw_spinlock_t tv_log_lock`. Each `tv_log()` call acquires lock via `raw_spin_lock_irqsave()`, writes `struct tv_log_entry` (64 bytes: timestamp_ns, level, disk_idx, event_type, msg[48]), then releases. Overflows overwrite oldest entry.
 
-### #56 uevent Listener
+**Data structure:** `struct tv_log_entry`, located in `tieredvol.h`.
 
-> Detect disk add/remove events via netlink uevent.
-
-**Planned approach:** Register a netlink listener for `block` subsystem events.
+**Key APIs:** `DECLARE_KFIFO()`, `kfifo_put()`, `kfifo_get()`, `kfifo_reset()`, `raw_spin_lock_irqsave()`
 
 **References:**
-1. `lib/kobject_uevent.c` — uevent netlink broadcast
-
----
-
-### #57 sysfs Monitor
-
-> Detect disk speed degradation via sysfs polling.
-
-**Planned approach:** Poll `/sys/block/<dev>/stat` for performance changes.
-
-**References:**
-1. `block/disk-events.c` — Disk event polling framework
-
----
-
-## 11. Structured Diagnostic Logging
-
-A kernel-space ring buffer that records I/O, stale, mirror, and configuration events with timestamps and severity levels. Events are queried via `dmsetup message`.
-
-### #58 Ring Buffer
-
-> Fixed-size `kfifo` ring buffer (512 entries) with spinlock protection, recording timestamped log entries.
-
-**Implementation:** `driver/tieredvol_core.c:29-54`. `DECLARE_KFIFO(tv_log_fifo, struct tv_log_entry, TV_LOG_SIZE)` with `DEFINE_SPINLOCK(tv_log_lock)`. Each `tv_log()` call acquires the spinlock with `spin_lock_irqsave()`, writes a `struct tv_log_entry` (64 bytes: timestamp_ns, level, disk_idx, event_type, msg[48]), and releases. Overflow overwrites oldest entries.
-
-**Data structure:** `struct tv_log_entry` in `driver/tieredvol.h:98-104`.
-
-**Core APIs:** `DECLARE_KFIFO()`, `kfifo_put()`, `kfifo_get()`, `kfifo_reset()`, `spin_lock_irqsave()`
-
-**References:**
-1. emlog (nicupavel) — Ring buffer architecture with overflow overwrite
+1. emlog (nicupavel) — ring buffer architecture with overflow overwrite
    https://github.com/nicupavel/emlog
 2. `kernel/samples/kfifo/record-example.c` — kfifo usage patterns
-3. `kernel/trace/ring_buffer.c` — High-performance lockless ring buffer
+3. `kernel/trace/ring_buffer.c` — high-performance lockless ring buffer
 
 ---
 
-### #59 Log Level
+### #62 Log Level
 
 > Dynamic verbosity control: OFF(0) / ERROR(1) / WARN(2) / INFO(3).
 
-**Implementation:** `driver/tieredvol_core.c:799-807`. `set_loglevel <0-3>` sets the global `tv_log_level`. The `tv_log()` function at line 39 checks `if (level > tv_log_level) return;`.
+**Implementation:** `tieredvol_message.c`. `set_loglevel <0-3>` sets global `tv_log_level`. `tv_log()` function checks `if (level > tv_log_level) return;`.
 
-**Core APIs:** `kstrtou32()`
+**Key APIs:** `kstrtou32()`
 
 **References:**
-1. `kernel/trace/trace.c` — Trace event management with log level control
+1. `kernel/trace/trace.c` — trace event management with log level control
 
 ---
 
-### #60 dmsetup Query (show_log / clear_log)
+### #63 DM Query (show_log / clear_log)
 
-> Real-time log query via `show_log` (dumps entries to dmesg) and `clear_log` (resets the ring buffer).
+> Real-time log query via `show_log` (non-destructive read using kfifo_out+kfifo_in) and `clear_log` (reset ring buffer).
 
-**Implementation:** `driver/tieredvol_core.c:764-798`.
-- `show_log`: Drains the kfifo under spinlock, prints each entry to dmesg with format `LOG {ERR|WRN|INF} {I/O|STALE|RCVR|MIRR|CONF}: <msg>`.
-- `clear_log`: Calls `kfifo_reset()` under spinlock.
+**Implementation:** `tieredvol_message.c`.
+- `show_log` (:475-514): Under raw_spinlock, uses `kfifo_out()` to drain entries to temporary array, prints each entry to dmesg in format `LOG {ERR|WRN|INF} {I/O|STALE|RCVR|MIRR|CONF}: <msg>`, then writes back via `kfifo_in()` preserving ring contents.
+- `clear_log`: Calls `kfifo_reset()` under raw_spinlock.
 
-**Core APIs:** `kfifo_get()`, `kfifo_reset()`, `DMINFO()`
+**Key APIs:** `kfifo_out()`, `kfifo_in()`, `kfifo_reset()`, `DMINFO()`
 
 **References:**
-1. dm-dust — DM message query/result pattern
-2. dm-log-writes — Structured I/O event logging
+1. `drivers/md/dm-dust.c` — DM message query/result pattern
+2. `drivers/md/dm-log-writes.c` — structured I/O event logging
+
+---
+
+## 10. Mirror + Pending Tracking
+
+v5.0 introduces per-CPU pending arrays for lockless mirror tracking, timestamp ring for precise latency measurement, and mempool for zero OOM.
+
+### #64 Per-CPU Pending Read Arrays
+
+> Per-CPU ring buffers tracking mirror read bios awaiting completion, avoiding global lock contention.
+
+**Implementation:** `tv_pending_add()`, located in `tieredvol_mirror.c:22-41`. Uses `DEFINE_PER_CPU(struct tv_pending_read_cpu, tv_pending_reads)`. Each CPU maintains `entries[64]` ring buffer with `head` and `count` tracking. `tv_pending_find_and_remove()` (:43-79) searches and removes from corresponding CPU's pending array on bio completion.
+
+**Key APIs:** `DEFINE_PER_CPU()`, `this_cpu_read()`, `this_cpu_write()`
+
+---
+
+### #65 Per-CPU Pending Write Arrays
+
+> Per-CPU ring buffers tracking mirror write bios awaiting completion.
+
+**Implementation:** Similar to #64, using `DEFINE_PER_CPU(struct tv_pending_write_cpu, tv_pending_writes)`, located in `tieredvol_mirror.c:209-213`.
+
+**Key APIs:** `DEFINE_PER_CPU()`
+
+---
+
+### #66 Timestamp Ring
+
+> Per-disk 256-entry ring buffer recording bio submission timestamps for precise latency measurement.
+
+**Implementation:** `struct tv_ts_ring` (`tieredvol_mirror.c:161-165`), contains `entries[256]`, `head`, `count`. `tv_ts_submit()` (:170-188) records `ktime_get_boottime_ns()` timestamp at bio submission. `tv_ts_complete()` (:190-219) retrieves timestamp on completion, computes latency delta and updates `total_latency_ns[d]` and `total_completions[d]`.
+
+**Key APIs:** `ktime_get_boottime_ns()`
+
+---
+
+### #67 Mempool
+
+> Mempool manages mirror bio clones and retry contexts, guaranteeing zero OOM allocation failure.
+
+**Implementation:**
+- `ctx->mirror_pw_pool`: Created in `tieredvol_ctr()` (`tieredvol_core.c:103`), for mirror write bio clone allocation.
+- `ctx->retry_ctx_pool`: Created in `tieredvol_mirror.c:372`, for I/O failure retry contexts.
+
+**Key APIs:** `mempool_create()`, `mempool_alloc()`, `mempool_free()`, `mempool_destroy()`
+
+---
+
+### #68 mirror_enabled_any Guard Flag
+
+> Global boolean flag for fast check whether any segment has mirroring enabled, avoiding unnecessary mirror logic execution.
+
+**Implementation:** `ctx->mirror_enabled_any`, located in `tieredvol.h:125`. Used as fast path check in `tieredvol_map()` (`tieredvol_core.c:279-285`): if `!ctx->mirror_enabled_any`, skip mirror logic. Set to true in `set_mirror` command (`tieredvol_mirror.c:398`).
+
+**Key APIs:** None (boolean flag)
+
+---
+
+## 11. Degradation Management
+
+Degradation subsystem tracks per-disk error counts, automatically entering degraded mode when errors exceed configurable threshold. Provides error reset, threshold configuration, degradation status query, and manual recovery.
+
+### #69 Per-disk Atomic Error Counter
+
+> Tracks per-disk accumulated errors using `atomic_t` array, incremented in bio completion callbacks.
+
+**Implementation:** `ctx->error_count[disk]`, allocated and initialized in `tieredvol_ctr()` via `kcalloc()` and `atomic_set(&ctx->error_count[i], 0)`. Incremented via `atomic_inc()` in `tv_mirror_end_io()` and other error paths.
+
+**Key APIs:** `atomic_set()`, `atomic_inc()`, `atomic_read()`
+
+---
+
+### #70 Configurable Error Threshold
+
+> Error threshold configurable via `set_error_threshold <n>`, triggering degraded mode when exceeded.
+
+**Implementation:** `ctx->deg.error_threshold`, set via message command #42 (`set_error_threshold`). Checked in `tieredvol_status()` callback against per-disk error counts.
+
+**Key APIs:** None (config value)
+
+---
+
+### #71 Auto-degradation Detection
+
+> Automatically enters degraded mode when any disk's error count exceeds threshold.
+
+**Implementation:** Degradation check logic in `tieredvol_status()`. Iterates all disks' `atomic_read(&ctx->error_count[d])`, sets `ctx->deg.is_degraded = true` and logs via `tv_log(TV_LOG_WARN, ...)` if threshold exceeded.
+
+**Key APIs:** `atomic_read()`
+
+---
+
+### #72 Degraded Mode Flag
+
+> Atomic flag indicating whether system is in degraded mode.
+
+**Implementation:** `ctx->deg.is_degraded`, a `bool` or `atomic_t` flag. Used as condition in `tv_log()` output and `tieredvol_status()`. Manually resettable via `clear_degraded` command.
+
+**Key APIs:** None (state flag)
+
+---
+
+### #73 Degraded Mode Recovery
+
+> Manually clears degraded mode flag via `clear_degraded` command.
+
+**Implementation:** Message command #44 (`clear_degraded`). Sets `ctx->deg.is_degraded = false` and logs. Auto-degradation will re-trigger on next threshold check if errors persist.
+
+**Key APIs:** None (state machine)
+
+---
+
+## 12. Rebuild Management
+
+Rebuild subsystem provides background data reconstruction using kthread and exponential backoff retry mechanism.
+
+### #74 kthread-based Background Rebuild
+
+> Uses kernel thread for background data reconstruction without blocking I/O path.
+
+**Implementation:** `start_rebuild` command (#45) creates `kthread_run(tv_rebuild_thread, ...)`. Rebuild thread processes data with configurable `max_bytes` per iteration. `stop_rebuild` command (#46) sets stop flag and waits for kthread exit via `kthread_stop()`.
+
+**Key APIs:** `kthread_run()`, `kthread_stop()`, `kthread_should_stop()`
+
+---
+
+### #75 Exponential Backoff Retry
+
+> Retries failed rebuilds with exponential backoff strategy, avoiding tight retry loops.
+
+**Implementation:** Retry logic in `tv_rebuild_thread()`. Uses `ctx->retry_ctx_pool` (`mempool`) for retry context allocation. Wait time grows exponentially after failure (initial 1ms, max 30s), then retries. Uses `schedule_timeout_interruptible()` for waiting.
+
+**Key APIs:** `mempool_alloc()`, `mempool_free()`, `schedule_timeout_interruptible()`
+
+---
+
+### #76 Rebuild Progress Tracking
+
+> Tracks rebuild progress: bytes processed, total bytes, status (running/completed/stopped).
+
+**Implementation:** `ctx->rebuild` structure (`struct tv_rebuild_state`). Contains `is_running`, `is_complete`, `bytes_processed`, `total_bytes` fields. Queryable via `show_rebuild` command (#47).
+
+**Key APIs:** None (state structure)
+
+---
+
+## 13. Sysfs Interface
+
+v5.0 adds sysfs interface with 7 attributes at /sys/kernel/tieredvol/ for runtime query and configuration. Implementation in `tieredvol_sysfs.c` (273 lines).
+
+### #77 policy (read-only)
+
+> Current dispatch policy: static, adaptive, or random.
+
+**Implementation:** `/sys/kernel/tieredvol/policy`. Read-only attribute returning text representation of `ctx->adaptive.policy`.
+
+---
+
+### #78 stale_ms (read-write)
+
+> Stale detection timeout in milliseconds.
+
+**Implementation:** `/sys/kernel/tieredvol/stale_ms`. Read returns `ctx->adaptive.stale_after_ns / 1000000`. Write sets `ctx->adaptive.stale_after_ns`.
+
+---
+
+### #79 wear_bias (read-write)
+
+> Wear penalty factor (0-1024).
+
+**Implementation:** `/sys/kernel/tieredvol/wear_bias`. Read returns `ctx->adaptive.wear_bias`. Write validates `<= 1024` then sets.
+
+---
+
+### #80 ema_shift (read-write)
+
+> EMA weight shift (0-10).
+
+**Implementation:** `/sys/kernel/tieredvol/ema_shift`. Read returns `ctx->adaptive.ema_weight_shift`. Write validates `<= 10` then sets.
+
+---
+
+### #81 loglevel (read-write)
+
+> Log verbosity (0-3: OFF/ERROR/WARN/INFO).
+
+**Implementation:** `/sys/kernel/tieredvol/loglevel`. Read returns `tv_log_level`. Write validates `<= 3` then sets.
+
+---
+
+### #82 disk_count (read-only)
+
+> Number of disks.
+
+**Implementation:** `/sys/kernel/tieredvol/disk_count`. Read-only attribute returning `ctx->ndisks`.
+
+---
+
+### #83 status (read-only)
+
+> Comprehensive status string.
+
+**Implementation:** `/sys/kernel/tieredvol/status`. Read-only attribute returning simplified status string similar to `dmsetup status`.
 
 ---
 
@@ -719,48 +1024,40 @@ A kernel-space ring buffer that records I/O, stale, mirror, and configuration ev
 
 | Paper | Venue | Relevance |
 |-------|-------|-----------|
-| Jiao & Kim, "Asymmetric RAID: Rethinking RAID for SSD Heterogeneity" | HotStorage'24 | Original Asym-RAID design; TieredVol extends this with dynamic detection |
+| Jiao & Kim, "Asymmetric RAID: Rethinking RAID for SSD Heterogeneity" | HotStorage'24 | Original Asym-RAID design; TieredVol extends with multi-factor adaptive dispatch |
 
 ### Linux Kernel Sources
 
-| File | URL | Features Referenced |
-|------|-----|---------------------|
+| File | Link | Referenced Features |
+|------|------|---------------------|
 | `drivers/md/dm-stripe.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-stripe.c) | #1 |
 | `drivers/md/dm-switch.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-switch.c) | #1, #2, #3 |
-| `drivers/md/dm-crypt.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-crypt.c) | #4, #41 |
-| `drivers/md/dm-raid1.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-raid1.c) | #6, #11, #14, #19, #39 |
-| `drivers/md/dm-dust.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-dust.c) | #11, #30, #60 |
-| `drivers/md/dm-thin.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-thin.c) | #7, #23, #30 |
+| `drivers/md/dm-crypt.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-crypt.c) | #4, #48 |
+| `drivers/md/dm-raid1.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-raid1.c) | #6, #12, #15, #20, #35 |
+| `drivers/md/dm-dust.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-dust.c) | #12, #28, #63 |
+| `drivers/md/dm-thin.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-thin.c) | #7, #58 |
 | `drivers/md/dm-linear.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-linear.c) | #4 |
-| `drivers/md/dm.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm.c) | #5, #19, #54 |
-| `drivers/md/dm-log.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-log.c) | #12, #51 |
-| `drivers/md/dm-log-writes.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-log-writes.c) | #58 |
-| `drivers/md/dm-thin-metadata.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-thin-metadata.c) | #51 |
-| `drivers/md/dm-table.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-table.c) | #53 |
-| `drivers/nvme/host/core.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/nvme/host/core.c) | #17 |
+| `drivers/md/dm.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm.c) | #5, #16, #20 |
+| `drivers/md/dm-log.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-log.c) | #13, #58 |
+| `drivers/md/dm-log-writes.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-log-writes.c) | #61, #63 |
+| `drivers/md/dm-thin-metadata.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-thin-metadata.c) | #58 |
+| `drivers/md/dm-table.c` | [link](https://github.com/torvalds/linux/blob/master/drivers/md/dm-table.c) | #59 |
 | `block/kyber-iosched.c` | [link](https://github.com/torvalds/linux/blob/master/block/kyber-iosched.c) | #2 |
 | `block/mq-deadline.c` | [link](https://github.com/torvalds/linux/blob/master/block/mq-deadline.c) | #2, #10 |
-| `block/blk-mq.c` | [link](https://github.com/torvalds/linux/blob/master/block/blk-mq.c) | #8, #16 |
-| `block/genhd.c` | [link](https://github.com/torvalds/linux/blob/master/block/genhd.c) | #18 |
-| `block/disk-events.c` | [link](https://github.com/torvalds/linux/blob/master/block/disk-events.c) | #13, #57 |
-| `kernel/time/timer_list.c` | [link](https://github.com/torvalds/linux/blob/master/kernel/time/timer_list.c) | #9 |
-| `kernel/sched/fair.c` | [link](https://github.com/torvalds/linux/blob/master/kernel/sched/fair.c) | #7, #21 |
-| `kernel/trace/ring_buffer.c` | [link](https://github.com/torvalds/linux/blob/master/kernel/trace/ring_buffer.c) | #58 |
-| `kernel/trace/trace.c` | [link](https://github.com/torvalds/linux/blob/master/kernel/trace/trace.c) | #59 |
-| `kernel/samples/kfifo/record-example.c` | [link](https://github.com/torvalds/linux/blob/master/samples/kfifo/record-example.c) | #58 |
-| `include/linux/percpu_counter.h` | [link](https://github.com/torvalds/linux/blob/master/include/linux/percpu_counter.h) | #20 |
-| `include/linux/mm_types.h` | [link](https://github.com/torvalds/linux/blob/master/include/linux/mm_types.h) | #22 |
-| `include/linux/ring_buffer.h` | [link](https://github.com/torvalds/linux/blob/master/include/linux/ring_buffer.h) | #58 |
-| `lib/kobject_uevent.c` | [link](https://github.com/torvalds/linux/blob/master/lib/kobject_uevent.c) | #56 |
-| `fs/configfs/configfs.c` | [link](https://github.com/torvalds/linux/blob/master/fs/configfs/configfs.c) | #53 |
+| `block/blk-mq.c` | [link](https://github.com/torvalds/linux/blob/master/block/blk-mq.c) | #10, #17 |
+| `kernel/time/timer_list.c` | [link](https://github.com/torvalds/linux/blob/master/kernel/time/timer_list.c) | #11 |
+| `kernel/sched/fair.c` | [link](https://github.com/torvalds/linux/blob/master/kernel/sched/fair.c) | #7 |
+| `kernel/trace/ring_buffer.c` | [link](https://github.com/torvalds/linux/blob/master/kernel/trace/ring_buffer.c) | #61 |
+| `kernel/trace/trace.c` | [link](https://github.com/torvalds/linux/blob/master/kernel/trace/trace.c) | #62 |
+| `kernel/samples/kfifo/record-example.c` | [link](https://github.com/torvalds/linux/blob/master/samples/kfifo/record-example.c) | #61 |
 
 ### Open-Source Projects
 
-| Project | URL | Features Referenced |
-|---------|-----|---------------------|
-| emlog (nicupavel) | https://github.com/nicupavel/emlog | #58 |
-| sysprog21/kfifo-examples | https://github.com/sysprog21/kfifo-examples | #58 |
-| mdadm | https://github.com/md-raid-utilities/mdadm | #54, #55 |
+| Project | Link | Referenced Features |
+|---------|------|---------------------|
+| emlog (nicupavel) | https://github.com/nicupavel/emlog | #61 |
+| sysprog21/kfifo-examples | https://github.com/sysprog21/kfifo-examples | #61 |
+| mdadm | https://github.com/md-raid-utilities/mdadm | #59 |
 
 ---
 
@@ -769,15 +1066,16 @@ A kernel-space ring buffer that records I/O, stale, mirror, and configuration ev
 | Category | Features | Tested |
 |----------|:--------:|:------:|
 | I/O Dispatch | 6 | 6 |
-| Load Balancing | 4 | 4 |
+| Load Balancing | 5 | 5 |
 | Stale Detection | 4 | 4 |
-| Per-Disk Stats | 5 | 5 |
-| Per-CPU Stats | 4 | 4 |
-| DM Messages | 17 | 17 |
+| Per-disk Stats | 5 | 5 |
+| DM Commands | 27 | 27 |
 | DM Lifecycle | 7 | 7 |
 | Status Reporting | 3 | 3 |
 | Metadata | 3 | 3 |
-| Structured Logging | 3 | 3 |
-| **Total** | **56** | **56** |
-
-> Note: 4 hot-plug features (#54-57) are abandoned. Not needed for research version, too complex.
+| Structured Log | 3 | 3 |
+| Mirror/Pending | 5 | 5 |
+| Degradation | 5 | 5 |
+| Rebuild | 3 | 3 |
+| Sysfs | 7 | 7 |
+| **Total** | **83** | **83** |

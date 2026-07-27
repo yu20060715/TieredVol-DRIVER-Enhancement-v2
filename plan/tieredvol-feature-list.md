@@ -1,282 +1,472 @@
-# TieredVol v4.6.0 已實現功能清單 + 開源專案參考
+# TieredVol v5.0.0 Feature List
 
 ---
 
-## 1. I/O 派送（6 種策略 + bio 操作）
+## v5.0 重要变更
 
-| # | 功能 | 說明 | 測試？ |
-|---|------|------|:------:|
-| 1 | **Static weighted dispatch** | 預計算的加權 stripe 邊界，確定性派送 | ✅ |
-| 2 | **Adaptive EMA dispatch** | 每個 bio 選最空閒碟（EMA 載入分數 + wear 懲罰），跳過 stale 碟 | ✅ |
-| 3 | **Random dispatch** | 隨機選碟（`get_random_u32()`） | ✅ |
-| 4 | **Bio sector remapping** | `bio_set_dev()` + 重寫 `bi_iter.bi_sector` | ✅ |
-| 5 | **Invalid disk error** | disk 超出範圍時 `bio_io_error()` | ✅ |
-| 6 | **Write mirroring** | bio clone + 提交到 mirror 碟 + 自定 `bi_end_io` | ✅ |
-
-**開源參考：**
-- `drivers/md/dm-switch.c` — 動態路徑切換，region-based bio 派送
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-switch.c
-- `drivers/md/dm-stripe.c` — 經典 striped target，加權分配
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-stripe.c
-- `drivers/md/dm-crypt.c` — bio clone + 重定向到加密層
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-crypt.c
-- `drivers/md/dm-raid1.c` — bio clone + 雙碟寫入 + 自定 bi_end_io
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-raid1.c
-
----
-
-## 2. 負載均衡 + 時間衰減
-
-| # | 功能 | 說明 | 測試？ |
-|---|------|------|:------:|
-| 7 | **EMA load 計算** | 每秒 timer tick，`ema = ema*(1-alpha) + snapshot*alpha`，alpha=8/1024 | ✅ |
-| 8 | **In-flight byte tracking** | 原子計數器，map 時 +1，timer tick 時 `atomic_xchg` 歸零 | ✅ |
-| 9 | **1-second decay timer** | `timer_list` 每 HZ 觸發一次 | ✅ |
-| 10 | **Wear-bias penalty** | `wear_bias × total_write_bytes / total_writes` 加到 load score | ✅ |
-
-**開源參考：**
-- `block/kyber-iosched.c` — 基於 token 的動態深度調整（類似 EMA 概念）
-  - https://github.com/torvalds/linux/blob/master/block/kyber-iosched.c
-- `block/mq-deadline.c` — 請求排序 + 時間衰減（FIFO 過期機制）
-  - https://github.com/torvalds/linux/blob/master/block/mq-deadline.c
-- `drivers/md/dm-thin.c` — pool 模式切換 + low watermark callback
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-thin.c
-- `kernel/time/timer_list.c` — `timer_list` API 參考
-  - https://github.com/torvalds/linux/blob/master/kernel/time/timer_list.c
+1. I/O 分派移至独立文件 `tieredvol_map.c`（曾内嵌在 `core.c` 的 `tieredvol_map()` 函数中）
+2. 新增 `tieredvol_map.c`（逻辑→物理映射：static/adaptive/random）
+3. 新增 `tieredvol_mirror.c`（镜像 I/O + pending 追踪 + timestamp ring + rebuild）
+4. 新增 `tieredvol_log.c`（日志 ring + EMA 衰减计时器）
+5. 新增 `tieredvol_message.c`（27 条消息命令，含 CRC32C）
+6. 新增 `tieredvol_meta.c`（配置文件解析器 + CRC32C）
+7. 新增 `tieredvol_sysfs.c`（sysfs 接口，7 个属性）
+8. 新增 `tieredvol.h`（集中定义所有结构体）
+9. 重构 `tieredvol_core.c` 为纯 DM 生命周期管理
+10. 移除 `tieredvol_stats.h`（统计功能合并到 `tv_io_stats`）
+11. 移除 `tv_read_iops/stats/latency` 字段（合并到 `tv_io_stats`）
+12. 新增多因子自适应分派（EMA 载入 + 延迟 + 磨损惩罚）
+13. 新增 per-CPU pending 数组（无锁镜像追踪）
+14. 新增 timestamp ring（精确延迟测量）
+15. 新增 mempool（零 OOM 镜像/重试上下文）
+16. 新增 CRC32C 校验（非破坏性预扫描）
+17. 新增自适应衰减计时器间隔（100ms/1s）
+18. 新增 mirror_enabled_any 守卫标志
+19. 新增 sysfs 运行时配置接口
+20. 新增降级管理（错误阈值 + 自动检测 + 手动恢复）
+21. 新增 rebuild 子系统（kthread + 指数退避）
 
 ---
 
-## 3. Stale 碟偵測 + 恢復
+## 1. I/O 分派
 
-| # | 功能 | 說明 | 測試？ |
-|---|------|------|:------:|
-| 11 | **Stale 標記** | 超過 `stale_after_ns`（預設 5 秒）無 I/O 的碟標記 stale | ✅ |
-| 12 | **Stale 恢復（I/O 觸發）** | stale 碟收到新 I/O 時立即 un-stale + 新 grace period | ✅ |
-| 13 | **Stale 恢復（冷卻）** | 2× `stale_after_ns` 後自動恢復 | ✅ |
-| 14 | **Grace period** | 新恢復的碟有 grace period 保護 | ✅ |
+### #1 静态加权分派 `tv_map_logical()`
+- 按 segment 的加权条带边界，确定性地映射逻辑偏移到物理碟
+- 实现：`tieredvol_map.c:4-65`
+- 内核参考：`dm-stripe.c`
 
-**開源參考：**
-- `drivers/md/dm-dust.c` — 壞軌模擬 + 動態啟用/停用（類似 stale 概念）
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-dust.c
-- `drivers/md/dm-raid1.c` — mirror failover + 錯誤偵測 + 自動切換
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-raid1.c
-- `drivers/md/dm-log.c` — dirty region tracking（類似 stale tracking）
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-log.c
-- `block/disk-events.c` — 磁碟事件輪詢 + 狀態追蹤
-  - https://github.com/torvalds/linux/blob/master/block/disk-events.c
+### #2 自适应多因子分派 `tv_map_logical_adaptive()`
+- 多因子评分选择最优碟，自动跳过 stale 碟
+- 评分 = ema_load + ema_latency_us + wear_penalty
+- 实现：`tieredvol_map.c:132-149`
+- 内核参考：`kyber-iosched.c`, `mq-deadline.c`
+- 学术参考：Asymmetric RAID (HotStorage'24)
 
----
+### #3 随机分派 `tv_map_logical_random()`
+- segment 内均匀随机选碟
+- 实现：`tieredvol_map.c:158-201`
 
-## 4. Per-disk I/O 統計
+### #4 Bio sector 重映射 `tieredvol_map()`
+- 通过 `bio_set_dev()` + `bi_iter.bi_sector` 重定向到正确物理碟
+- 实现：`tieredvol_core.c:33-164`
+- 内核参考：`dm-crypt.c`, `dm-linear.c`
 
-| # | 功能 | 說明 | 測試？ |
-|---|------|------|:------:|
-| 15 | Read bytes counter | `total_read_bytes[disk]` | ✅ |
-| 16 | Read ops counter | `total_read_ops[disk]` | ✅ |
-| 17 | Write bytes counter | `total_write_bytes[disk]` | ✅ |
-| 18 | Write ops counter | `total_write_ops[disk]` | ✅ |
-| 19 | Error counter | `error_count[disk]`（atomic_t） | ✅ |
+### #5 无效碟错误 `tieredvol_map()`
+- 碟索引越界时返回 bio_io_error
+- 实现：`tieredvol_core.c:89-96`
+- 内核参考：`dm.c`
 
-**開源參考：**
-- `drivers/md/dm.c` — DM 核心的 bio 統計（`dm_stats_message`）
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm.c
-- `block/blk-mq.c` — blk-mq 的 per-tag 統計
-  - https://github.com/torvalds/linux/blob/master/block/blk-mq.c
-- `drivers/nvme/host/core.c` — NVMe 的 per-controller 統計
-  - https://github.com/torvalds/linux/blob/master/drivers/nvme/host/core.c
-- `block/genhd.c` — `part_stat_show` per-partition 統計展示
-  - https://github.com/torvalds/linux/blob/master/block/genhd.c
+### #6 写入镜像
+- clone 写入 bio 提交到镜像碟，零 OOM（mempool）
+- 实现：`tieredvol_core.c:126-160`
+- 内核参考：`dm-raid1.c`
 
 ---
 
-## 5. Per-CPU 全域統計
+## 2. 负载均衡
 
-| # | 功能 | 說明 | 測試？ |
-|---|------|------|:------:|
-| 20 | Per-CPU map count | `this_cpu_inc` | ✅ |
-| 21 | Per-CPU sector count | `this_cpu_add` | ✅ |
-| 22 | Per-CPU byte count | `this_cpu_add` | ✅ |
-| 23 | Cross-CPU aggregation | `tv_read_count/sectors/bytes()` 迭代所有 CPU | ✅ |
+### #7 EMA 载入计算
+- `ema = ema * (1 - alpha) + snapshot * alpha`
+- 实现：`tieredvol_log.c:81-83`
+- 内核参考：`kernel/sched/fair.c`
 
-**開源參考：**
-- `include/linux/percpu_counter.h` — `percpu_counter` API（批量聚合）
-  - https://github.com/torvalds/linux/blob/master/include/linux/percpu_counter.h
-- `kernel/sched/fair.c` — CFS 的 per-CPU 載入追蹤
-  - https://github.com/torvalds/linux/blob/master/kernel/sched/fair.c
-- `drivers/md/dm-thin.c` — pool 的 per-CPU deferred set
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-thin.c
-- `include/linux/mm_types.h` — `vm_stat` per-CPU 計數器
-  - https://github.com/torvalds/linux/blob/master/include/linux/mm_types.h
+### #8 EMA IOPS 计算
+- 平滑突發 IOPS
+- 实现：`tieredvol_log.c:86-88`
 
----
+### #9 EMA 延迟测量
+- 结合 timestamp ring 精确追踪
+- 实现：`tieredvol_log.c:91-102`, `tieredvol_mirror.c:155-219`
 
-## 6. DM Message 指令（15+ 個）
+### #10 In-flight 字节追踪
+- 每碟原子计数器
+- 实现：`tieredvol_core.c:109`
+- 内核参考：`blk-mq.c`
 
-| # | 指令 | 說明 | 測試？ |
-|---|------|------|:------:|
-| 24 | `reset_stats` | 歸零 per-CPU 統計 | ✅ |
-| 25 | `show_stats` | 回傳 maps count, avg bytes, total bytes | ✅ |
-| 26 | `status` | 回傳各碟名稱 + weight | ✅ |
-| 27 | `show_inflight` | 回傳各碟 in-flight bytes | ✅ |
-| 28 | `adaptive_on` | 切換到 adaptive policy | ✅ |
-| 29 | `adaptive_off` | 切換到 static policy | ✅ |
-| 30 | `set_policy <name>` | 設定 static/adaptive/random | ✅ |
-| 31 | `set_ema_shift` | 設定 EMA shift（⚠️ **已修 bug**：argc 檢查） | ✅ |
-| 32 | `set_stale_ms <ms>` | 設定 stale 偵測超時 | ✅ |
-| 33 | `show_adaptive` | 回傳 policy + EMA + stale + wear 資訊 | ✅ |
-| 34 | `show_wear` | 回傳 wear_bias + 各碟 write bytes | ✅ |
-| 35 | `show_io_stats` | 回傳各碟 read/write ops/bytes | ✅ |
-| 36 | `reset_io_stats` | 歸零各碟 I/O 統計 | ✅ |
-| 37 | `set_wear_bias <bias>` | 設定 wear 懲罰因子 | ✅ |
-| 38 | `reset_wear` | 歸零各碟 write bytes | ✅ |
-| 39 | `show_mirror` | 回傳 mirror 統計 | ✅ |
-| 40 | `set_mirror <seg> <disk>` | 設定 mirror 目標 | ✅ |
-
-**開源參考：**
-- `drivers/md/dm-dust.c` — 20+ 個 message 指令（addbadblock/removebadblock/enable/disable/queryblock）
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-dust.c
-- `drivers/md/dm-switch.c` — `process_set_region_mappings` 動態 region 重新映射
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-switch.c
-- `drivers/md/dm-raid1.c` — mirror 指令（add/remove/flush/stats）
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-raid1.c
-- `drivers/md/dm-thin.c` — thin pool 指令（create_thin/delete_thin/set_transaction_id）
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-thin.c
+### #11 自适应衰减计时器间隔
+- 高活跃 → 100ms，低活跃 → 1s
+- 实现：`tieredvol_log.c:143-145`
+- 内核参考：`kernel/time/timer_list.c`
 
 ---
 
-## 7. DM Target 生命週期
+## 3. Stale 碟检测
 
-| # | 功能 | 說明 |
-|---|------|------|
-| 41 | Constructor (ctr) | 分配 context、讀取 metadata、開啟 DM 裝置 | ✅ |
-| 42 | Destructor (dtr) | 刪除 timer、flush work、釋放記憶體 | ✅ |
-| 43 | IO hints | 回報 block size、chunk size、io_opt | ✅ |
-| 44 | Iterate devices | 回傳所有底層裝置 | ✅ |
-| 45 | Prepare ioctl | 回傳第一個裝置的 bdev | ✅ |
-| 46 | Flush/Discard propagation | `num_flush_bios = ndisks` | ✅ |
-| 47 | Module init/exit | 註冊 DM target + workqueue | ✅ |
+### #12 Stale 标记
+- 超时无 I/O 完成时标记
+- 实现：`tieredvol_log.c:112-123`
+- 内核参考：`dm-dust.c`, `dm-raid1.c`
 
-**開源參考：**
-- `drivers/md/dm-crypt.c` — 完整的 ctr/dtr/map 生命週期 + mempool 管理
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-crypt.c
-- `drivers/md/dm-thin.c` — 複雜的 ctr（pool 建立）+ dtr（資源釋放）
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-thin.c
-- `drivers/md/dm-stripe.c` — 簡潔的 ctr/dtr 參考
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-stripe.c
-- `drivers/md/dm-linear.c` — 最簡單的 DM target 範例
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-linear.c
+### #13 Stale 恢复 — I/O 触发
+- 新 I/O 完成时立即恢复
+- 实现：`tieredvol_log.c:124-129`
+- 内核参考：`dm-log.c`
 
----
+### #14 Stale 恢复 — 冷却
+- 2 倍超时后自动恢复
+- 实现：`tieredvol_log.c:130-138`
+- 内核参考：`disk-events.c`
 
-## 8. Status 報告（dmsetup status）
-
-| # | 功能 | 說明 |
-|---|------|------|
-| 48 | STATUSTYPE_INFO | policy + mirror + error + per-disk A/D + read/write |
-| 49 | STATUSTYPE_TABLE | 碟名列表 |
-| 50 | STATUSTYPE_IMA | IMA placeholder |
-
-**開源參考：**
-- `drivers/md/dm-raid1.c` — 詳細的 status 輸出（per-mirror state + sync 進度）
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-raid1.c
-- `drivers/md/dm-thin.c` — 模式感知的 status（PM_WRITE/PM_READ_ONLY/PM_FAIL）
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-thin.c
-- `drivers/md/dm-dust.c` — 狀態感知的 status（fail_read_on_bad_block）
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-dust.c
+### #15 保护期
+- 防止恢复后立即重标记
+- 实现：`tieredvol_log.c:126,134`
+- 内核参考：`dm-raid1.c`
 
 ---
 
-## 9. Metadata 解析（Kernel）
+## 4. Per-disk I/O 统计
 
-| # | 功能 | 說明 |
-|---|------|------|
-| 51 | Kernel file-based config | `filp_open()` + `kernel_read()` + key=value 解析 |
-| 52 | Version/chunk/segment/disk parsing | 完整參數驗證 |
-| 53 | Segment disks/weight CSV parsing | 逗號分隔 u32 陣列 |
+### #16 读取字节计数器
+- 实现：`tieredvol_core.c:114`
 
-**開源參考：**
-- `drivers/md/dm-thin-metadata.c` — 複雜的 metadata 管理（B-tree + superblock）
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-thin-metadata.c
-- `drivers/md/dm-log.c` — disk log 狀態持久化
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-log.c
-- `fs/configfs/configfs.c` — kernel-userspace 配置介面
-  - https://github.com/torvalds/linux/blob/master/fs/configfs/configfs.c
-- `drivers/md/dm-table.c` — DM table 解析（裝置路徑 + offset）
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm-table.c
+### #17 读取操作计数器
+- 实现：`tieredvol_core.c:115`
 
----
+### #18 写入字节计数器
+- 实现：`tieredvol_core.c:111`
 
-## 10. ~~熱插拔 + 動態偵測~~ **[ABANDONED]**
+### #19 写入操作计数器
+- 实现：`tieredvol_core.c:112`
 
-> **Status:** 放棄。研究版本不需要此功能，複雜度過高（DM table reload + metadata 重建），ROI 不符合研究專案需求。
-
-| # | 功能 | 說明 | 參考專案 |
-|---|------|------|----------|
-| 54 | **Online Add** | 新增碟時動態擴展 segment | mdadm `Grow_Add_device()` |
-| 55 | **Online Remove** | 移除碟前遷移 stripe | mdadm `--remove` |
-| 56 | **uevent listener** | netlink 偵測碟的新增/移除 | `lib/kobject_uevent.c` |
-| 57 | **sysfs monitor** | 偵測速度退化 | `block/disk-events.c` |
-
-**開源參考：**
-- `mdadm/Grow.c` — 線性陣列的熱新增（`Grow_Add_device`）
-  - https://github.com/md-raid-utilities/mdadm/blob/main/Grow.c
-- `drivers/md/dm.c` — DM 裝置的動態建立/刪除（`dev_create`/`dev_remove`）
-  - https://github.com/torvalds/linux/blob/master/drivers/md/dm.c
-- `lib/kobject_uevent.c` — uevent netlink 廣播
-  - https://github.com/torvalds/linux/blob/master/lib/kobject_uevent.c
-- `block/disk-events.c` — 磁碟事件輪詢框架
-  - https://github.com/torvalds/linux/blob/master/block/disk-events.c
+### #20 错误计数器
+- 原子计数，bio 完成错误时递增
+- 内核参考：`dm.c`, `dm-raid1.c`
 
 ---
 
-## 11. 結構化診斷日誌（NSC 計畫新增目標）
+## 5. DM Message 命令（27条）
 
-| # | 功能 | 說明 | 測試？ |
-|---|------|------|:------:|
-| 58 | **Ring buffer** | `kfifo` 512 entries，記錄 I/O/stale/mirror/config 事件 | ✅ |
-| 59 | **Log level** | `set_loglevel 0-3` 動態調整詳細程度 | ✅ |
-| 60 | **dmsetup query** | `show_log` / `clear_log` 即時查詢清空日誌 | ✅ |
+### `reset_stats`（0）
+- 清除所有 I/O 统计
+- 实现：`tieredvol_message.c`
 
-**實作參考（借用來源）：**
+### `show_stats`（1）
+- 返回每碟读写 ops/bytes
+- 实现：`tieredvol_message.c`
 
-| 參考專案 | 借鑒內容 | 連結 |
-|----------|----------|------|
-| **emlog** (nicupavel) | ring buffer 整體架構：固定大小 buffer、overflow 覆寫、rwlock 模式 | https://github.com/nicupavel/emlog |
-| **dm-log-writes** | 結構化 I/O 事件的欄位設計（`log_write_entry`：timestamp + sector + len + flags） | https://github.com/torvalds/linux/blob/master/drivers/md/dm-log-writes.c |
-| **dm-dust** | DM message query/result 模式：`dust_message()` 處理指令 + `DMINFO()` 回傳結果 | https://github.com/torvalds/linux/blob/master/drivers/md/dm-dust.c |
-| **sysprog21/kfifo-examples** | kfifo 基本用法：`DECLARE_KFIFO` + `kfifo_in/out` + mutex | https://github.com/sysprog21/kfifo-examples |
-| **kernel/samples/kfifo/record-example.c** | 變長紀錄 kfifo：`kfifo_rec_ptr_1` + `kfifo_peek_len()` | https://github.com/torvalds/linux/blob/master/samples/kfifo/record-example.c |
+### `show_inflight`（3）
+- 返回每碟 in-flight 字节数
+- 实现：`tieredvol_message.c`
 
-**開源參考（官方 kernel）：**
-- `kernel/trace/ring_buffer.c` — 高效能 lockless ring buffer 參考實作
-  - https://github.com/torvalds/linux/blob/master/kernel/trace/ring_buffer.c
-- `kernel/trace/trace.c` — trace event 管理 + log level 控制
-  - https://github.com/torvalds/linux/blob/master/kernel/trace/trace.c
-- `include/linux/ring_buffer.h` — ring buffer API 頭檔
-  - https://github.com/torvalds/linux/blob/master/include/linux/ring_buffer.h
+### `show_io_stats`（4）
+- 返回完整 per-disk I/O 统计
+- 实现：`tieredvol_message.c`
+
+### `reset_io_stats`（5）
+- 归零所有 7 个计数器
+- 实现：`tieredvol_message.c`
+
+### `adaptive_on`（6）
+- 启用自适应分派
+- 实现：`tieredvol_message.c`
+
+### `adaptive_off`（7）
+- 切换回静态分派
+- 实现：`tieredvol_message.c`
+
+### `set_policy <name>`（8）
+- 设置分派策略 static/adaptive/random
+- 实现：`tieredvol_message.c`
+
+### `set_ema_shift <shift>`（9）
+- 设置 EMA alpha shift（0-10）
+- 实现：`tieredvol_message.c`
+
+### `set_stale_ms <ms>`（10）
+- 设置 stale 超时（毫秒）
+- 实现：`tieredvol_message.c`
+
+### `show_adaptive`（11）
+- 返回策略/EMA/latency/stale/wear 状态
+- 实现：`tieredvol_message.c:304-327`
+
+### `show_wear`（12）
+- 返回 wear bias 和每碟写入字节
+- 实现：`tieredvol_message.c`
+
+### `set_wear_bias <bias>`（13）
+- 设置磨損懲罰因子（0-1024）
+- 实现：`tieredvol_message.c`
+
+### `reset_wear`（14）
+- 归零磨損字節計數器
+- 实现：`tieredvol_message.c`
+
+### `show_mirror`（15）
+- 返回镜像状态
+- 实现：`tieredvol_message.c`
+
+### `set_mirror <seg> <disk>`（16）
+- 为 segment 启用镜像
+- 实现：`tieredvol_message.c`
+- `ctx->mirror_enabled_any = true`（`tieredvol_mirror.c:398`）
+
+### `show_log`（17）
+- 非破坏性读取日志（kfifo_out+kfifo_in）
+- 实现：`tieredvol_message.c:475-514`
+
+### `clear_log`（18）
+- 重置日志 ring
+- 实现：`tieredvol_message.c`
+
+### `set_loglevel <0-3>`（19）
+- 设置日志等级 OFF/ERROR/WARN/INFO
+- 实现：`tieredvol_message.c`
+
+### `show_errors`（20）
+- 返回每碟错误计数
+- 实现：`tieredvol_message.c`
+
+### `reset_errors`（21）
+- 归零所有错误计数
+- 实现：`tieredvol_message.c`
+
+### `set_error_threshold <n>`（22）
+- 设置触发降级的错误阈值
+- 实现：`tieredvol_message.c`
+
+### `show_degraded`（23）
+- 返回降级状态
+- 实现：`tieredvol_message.c`
+
+### `clear_degraded`（24）
+- 手动清除降级标志
+- 实现：`tieredvol_message.c`
+
+### `start_rebuild [max_bytes]`（25）
+- 启动背景重建线程
+- 实现：`tieredvol_message.c`
+
+### `stop_rebuild`（26）
+- 停止背景重建线程
+- 实现：`tieredvol_message.c`
+
+### `show_rebuild`（27）
+- 返回重建进度
+- 实现：`tieredvol_message.c`
 
 ---
 
-## 測試覆蓋率
+## 6. DM 生命周期
 
-| 類別 | 功能數 | 有測試 | 狀態 |
-|------|:------:|:------:|------|
-| I/O dispatch | 6 | 6 | ✅ |
-| Load balancing | 4 | 4 | ✅ |
-| Stale detection | 4 | 4 | ✅ |
-| Per-disk stats | 5 | 5 | ✅ |
-| Per-CPU stats | 4 | 4 | ✅ |
-| DM messages | 17 | 17 | ✅ |
-| DM lifecycle | 7 | 7 | ✅ |
-| Status | 3 | 3 | ✅ |
-| Metadata | 3 | 3 | ✅ |
-| Structured logging | 3 | 3 | ✅ |
-| **Total** | **56** | **56** | **All implemented** |
-| ~~熱插拔~~ | ~~4~~ | ~~0~~ | **ABANDONED** |
+### #48 构造函数 `tieredvol_ctr()`
+- 解析参数，加载元数据，获取 DM 设备，分配 mempool，启动衰减计时器
+- 实现：`tieredvol_core.c`
+
+### #49 析构函数 `tieredvol_dtr()`
+- 停止计时器/线程，释放设备和内存
+- 实现：`tieredvol_core.c`
+
+### #50 IO hints
+- 向 DM 框架报告最优 I/O 大小
+- 实现：`tieredvol_core.c`
+
+### #51 Iterate devices
+- 遍历所有底层 DM 设备
+- 实现：`tieredvol_core.c`
+
+### #52 Prepare ioctl
+- 返回第一个底层 bdev 供 ioctl 透传
+- 实现：`tieredvol_core.c`
+
+### #53 Flush/Discard 传播
+- 将 flush/discard 传播到所有底层碟
+- 实现：`tieredvol_core.c`
+
+### #54 模块初始化/退出
+- 注册/注销 DM 目标
+- 实现：`tieredvol_core.c:534-577`
 
 ---
 
-## ⚠️ 已知 Bug
+## 7. 状态报告
 
-- ~~`set_ema_shift`：`argc == 1` 但讀取 `argv[1]`，會 kernel oops~~ ✅ 已修復（改為 `argc == 2`）
-- ~~`bio_alloc_clone` mirror write：傳 `NULL` bioset 導致 kernel NULL pointer dereference~~ ✅ 已修復（改為 `&fs_bio_set`）
+### #55 STATUSTYPE_INFO
+- 策略/镜像/错误/每碟 active+rd/wr 计数
+- 实现：`tieredvol_core.c`
+
+### #56 STATUSTYPE_TABLE
+- 底层碟设备名列表
+- 实现：`tieredvol_core.c`
+
+### #57 STATUSTYPE_IMA
+- IMA 占位符
+- 实现：`tieredvol_core.c`
+
+---
+
+## 8. 元数据 + CRC32C
+
+### #58 内核态文件配置
+- filp_open + kernel_read
+- 实现：`tieredvol_meta.c`
+- 内核参考：`dm-thin-metadata.c`, `dm-log.c`
+
+### #59 Version/Chunk/Segment/Disk 解析
+- 含镜像安全性验证（mirror_disk != 主碟）
+- 实现：`tieredvol_meta.c:150-187, 377-387`
+
+### #60 CRC32C 校验
+- 非破坏性预扫描 + position-based CRC
+- 实现：`tieredvol_meta.c:98-133, 183-219`
+
+---
+
+## 9. 结构化日志
+
+### #61 环形缓冲区
+- kfifo + raw_spinlock，512 条目
+- 实现：`tieredvol_log.c:27`
+- 内核参考：`kernel/samples/kfifo/record-example.c`
+
+### #62 日志等级
+- 动态详细程度控制 OFF/ERROR/WARN/INFO
+- 实现：`tieredvol_message.c`
+- 内核参考：`kernel/trace/trace.c`
+
+### #63 DM 查询
+- show_log（非破坏性）/ clear_log（重置）
+- 实现：`tieredvol_message.c:475-514`
+- 内核参考：`dm-dust.c`, `dm-log-writes.c`
+
+---
+
+## 10. 镜像 + Pending 追踪
+
+### #64 Per-CPU 读取 Pending 数组
+- 无锁 ring buffer 追踪镜像读取 bio
+- 实现：`tieredvol_mirror.c:22-79`
+
+### #65 Per-CPU 写入 Pending 数组
+- 无锁 ring buffer 追踪镜像写入 bio
+- 实现：`tieredvol_mirror.c:209-213`
+
+### #66 Timestamp Ring
+- 每碟 256 条目，精确延迟测量
+- 实现：`tieredvol_mirror.c:161-219`
+
+### #67 Mempool
+- 零 OOM 镜像 bio 和重试上下文
+- 实现：`tieredvol_core.c:288-296`, `tieredvol_mirror.c:372`
+
+### #68 mirror_enabled_any 守卫标志
+- 全局布尔标志，快速跳过镜像逻辑
+- 实现：`tieredvol.h:125`, `tieredvol_core.c:279-285`, `tieredvol_mirror.c:398`
+
+---
+
+## 11. 降级管理
+
+### #69 Per-disk 原子错误计数器
+- 实现：`tieredvol_core.c`
+
+### #70 可配置错误阈值
+- 实现：`tieredvol_message.c`
+
+### #71 自动降级检测
+- 实现：`tieredvol_core.c`
+
+### #72 降级模式标志
+- 实现：`tieredvol_core.c`
+
+### #73 降级模式恢复
+- 实现：`tieredvol_message.c`
+
+---
+
+## 12. 重建管理
+
+### #74 kthread 背景重建
+- 实现：`tieredvol_message.c`
+
+### #75 指数退避重试
+- 实现：`tieredvol_mirror.c`
+
+### #76 重建进度追踪
+- 实现：`tieredvol_message.c`
+
+---
+
+## 13. Sysfs 接口
+
+### #77 policy（只读）
+- `/sys/kernel/tieredvol/policy`
+- 返回 static/adaptive/random
+
+### #78 stale_ms（可读写）
+- `/sys/kernel/tieredvol/stale_ms`
+- 读返回毫秒，写设置 ns
+
+### #79 wear_bias（可读写）
+- `/sys/kernel/tieredvol/wear_bias`
+- 读写验证 0-1024
+
+### #80 ema_shift（可读写）
+- `/sys/kernel/tieredvol/ema_shift`
+- 读写验证 0-10
+
+### #81 loglevel（可读写）
+- `/sys/kernel/tieredvol/loglevel`
+- 读写验证 0-3
+
+### #82 disk_count（只读）
+- `/sys/kernel/tieredvol/disk_count`
+- 返回 ndisks
+
+### #83 status（只读）
+- `/sys/kernel/tieredvol/status`
+- 返回状态摘要
+
+---
+
+## 单元测试
+
+```
+test/test.sh           38/38  ✓
+test/test_message.sh   40/40  ✓
+test/test_sysfs.sh      3/3   ✓
+```
+
+## 集成测试
+
+```
+test/test_integration.sh   81/81  ✓
+```
+
+---
+
+## 参考文献
+
+### 学术论文
+- Jiao & Kim, "Asymmetric RAID: Rethinking RAID for SSD Heterogeneity" — HotStorage'24
+
+### 内核源码
+| 文件 | 引用 |
+|------|------|
+| `drivers/md/dm-stripe.c` | #1 |
+| `drivers/md/dm-switch.c` | #1, #2, #3 |
+| `drivers/md/dm-crypt.c` | #4, #48 |
+| `drivers/md/dm-raid1.c` | #6, #12, #15, #20, #35 |
+| `drivers/md/dm-dust.c` | #12, #28, #63 |
+| `drivers/md/dm-thin.c` | #7, #58 |
+| `drivers/md/dm-linear.c` | #4 |
+| `drivers/md/dm.c` | #5, #16, #20 |
+| `drivers/md/dm-log.c` | #13, #58 |
+| `drivers/md/dm-log-writes.c` | #61, #63 |
+| `drivers/md/dm-thin-metadata.c` | #58 |
+| `drivers/md/dm-table.c` | #59 |
+| `block/kyber-iosched.c` | #2 |
+| `block/mq-deadline.c` | #2, #10 |
+| `block/blk-mq.c` | #10, #17 |
+| `kernel/time/timer_list.c` | #11 |
+| `kernel/sched/fair.c` | #7 |
+| `kernel/trace/ring_buffer.c` | #61 |
+| `kernel/trace/trace.c` | #62 |
+| `kernel/samples/kfifo/record-example.c` | #61 |
+
+### 开源项目
+| 项目 | 引用 |
+|------|------|
+| emlog (nicupavel) | #61 |
+| sysprog21/kfifo-examples | #61 |
+| mdadm | #59 |
