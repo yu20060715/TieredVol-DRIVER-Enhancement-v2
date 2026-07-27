@@ -179,7 +179,7 @@ enum tv_log_event {
 
 extern struct kfifo tv_log_fifo;
 extern raw_spinlock_t tv_log_lock;
-extern spinlock_t tv_ts_lock_arr[];
+extern raw_spinlock_t tv_ts_lock_arr[];
 extern u8 tv_log_level;
 extern unsigned int log_size;
 extern struct workqueue_struct *tv_wq;

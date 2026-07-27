@@ -569,7 +569,7 @@ static int __init tieredvol_init(void)
 		int k;
 
 		for (k = 0; k < TV_MAX_DISKS; k++)
-			spin_lock_init(&tv_ts_lock_arr[k]);
+			raw_spin_lock_init(&tv_ts_lock_arr[k]);
 	}
 
 	pr_info("tieredvol: module loaded (log_size=%u)\n", log_size);
