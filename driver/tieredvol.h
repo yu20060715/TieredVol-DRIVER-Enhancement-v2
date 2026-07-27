@@ -129,6 +129,8 @@ struct tieredvol_ctx {
 	struct tv_rebuild_state rebuild;
 	bool mirror_enabled_any;
 	struct work_struct trigger_event;
+	mempool_t *mirror_pw_pool;
+	mempool_t *retry_ctx_pool;
 };
 
 /* ---- tieredvol_map.c exports ---- */
@@ -188,6 +190,34 @@ extern raw_spinlock_t tv_log_lock;
 extern u8 tv_log_level;
 extern unsigned int log_size;
 extern struct workqueue_struct *tv_wq;
+
+/* ---- Pending-read tracking (per-CPU, lockless) ---- */
+struct tv_pending_read_entry {
+	struct block_device *bdev;
+	sector_t sector;
+	sector_t mirror_sector;
+	unsigned int size;
+	int mirror_disk;
+};
+
+struct tv_pending_read_cpu {
+	struct tv_pending_read_entry entries[64];
+	unsigned int head;
+	unsigned int count;
+};
+
+/* ---- Pending-write tracking (per-CPU, lockless) ---- */
+struct tv_pending_write_entry {
+	struct block_device *bdev;
+	sector_t sector;
+	unsigned int size;
+};
+
+struct tv_pending_write_cpu {
+	struct tv_pending_write_entry entries[64];
+	unsigned int head;
+	unsigned int count;
+};
 
 /* ---- tieredvol_mirror.c exports ---- */
 struct tv_mirror_pw_ctx {

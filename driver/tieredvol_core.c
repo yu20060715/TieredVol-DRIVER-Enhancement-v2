@@ -97,7 +97,7 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 				TV_SECTOR_SHIFT;
 			unsigned int bio_sz = bio->bi_iter.bi_size;
 
-			pwc = kmalloc(sizeof(*pwc), GFP_NOIO);
+			pwc = mempool_alloc(ctx->mirror_pw_pool, GFP_NOIO);
 			if (!pwc) {
 				atomic64_inc(&ctx->mirror.mirror_errors);
 				tv_log(TV_LOG_ERR, cur.disk, TV_LOG_MIRROR,
@@ -109,7 +109,7 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 				ctx->devs[seg->mirror_disk]->bdev, bio,
 				GFP_NOIO, &fs_bio_set);
 			if (!clone) {
-				kfree(pwc);
+				mempool_free(pwc, ctx->mirror_pw_pool);
 				atomic64_inc(&ctx->mirror.mirror_errors);
 				tv_log(TV_LOG_ERR, cur.disk, TV_LOG_MIRROR,
 				       "mirror alloc fail seg%d", cur.seg_idx);
@@ -276,13 +276,30 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	{
 		u32 si;
 
-		ctx->mirror_enabled_any = false;
-		for (si = 0; si < ctx->meta.segment_count; si++) {
-			if (ctx->meta.segments[si].mirror_enabled) {
-				ctx->mirror_enabled_any = true;
-				break;
-			}
+	ctx->mirror_enabled_any = false;
+	for (si = 0; si < ctx->meta.segment_count; si++) {
+		if (ctx->meta.segments[si].mirror_enabled) {
+			ctx->mirror_enabled_any = true;
+			break;
 		}
+	}
+
+	/* Create mempools for mirror bio contexts */
+	ctx->mirror_pw_pool = mempool_create_kmalloc_pool(
+		128, sizeof(struct tv_mirror_pw_ctx));
+	if (!ctx->mirror_pw_pool) {
+		ti->error = "tieredvol: mempool alloc failed (mirror_pw)";
+		ret = -ENOMEM;
+		goto free_error_count;
+	}
+	ctx->retry_ctx_pool = mempool_create_kmalloc_pool(
+		32, sizeof(struct tv_retry_ctx));
+	if (!ctx->retry_ctx_pool) {
+		mempool_destroy(ctx->mirror_pw_pool);
+		ti->error = "tieredvol: mempool alloc failed (retry_ctx)";
+		ret = -ENOMEM;
+		goto free_error_count;
+	}
 	}
 
 	/* Compute min_chunk_sectors and stripe_sectors */
@@ -372,6 +389,9 @@ static void tieredvol_dtr(struct dm_target *ti)
 
 	timer_delete_sync(&ctx->adaptive.decay_timer);
 	flush_work(&ctx->trigger_event);
+
+	mempool_destroy(ctx->mirror_pw_pool);
+	mempool_destroy(ctx->retry_ctx_pool);
 
 	if (atomic_read(&ctx->rebuild.running)) {
 		atomic_set(&ctx->rebuild.running, 0);

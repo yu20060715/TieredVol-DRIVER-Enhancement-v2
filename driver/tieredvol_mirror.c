@@ -15,165 +15,139 @@
 #include <linux/device-mapper.h>
 #include "tieredvol.h"
 
-/* ---- Pending-read tracking (1c) ---- */
+/* ---- Pending-read tracking (per-CPU, lockless) ---- */
 
-struct tv_pending_read {
-	struct block_device *bdev;
-	sector_t sector;
-	sector_t mirror_sector;
-	unsigned int size;
-	int mirror_disk;
-};
-
-#define TV_PENDING_MAX 1024
-
-static struct tv_pending_read tv_pending_reads[TV_PENDING_MAX];
-static unsigned int tv_pending_head;
-static unsigned int tv_pending_count;
-static DEFINE_SPINLOCK(tv_pending_lock);
+static DEFINE_PER_CPU(struct tv_pending_read_cpu, tv_pcpu_reads);
 
 void tv_pending_add(struct block_device *bdev, sector_t sector,
 		    unsigned int size, int mirror_disk,
 		    sector_t mirror_sector)
 {
-	unsigned long flags;
+	struct tv_pending_read_cpu *pcpu = this_cpu_ptr(&tv_pcpu_reads);
 	unsigned int idx;
 
-	spin_lock_irqsave(&tv_pending_lock, flags);
-	idx = (tv_pending_head + tv_pending_count) % TV_PENDING_MAX;
-	if (tv_pending_count < TV_PENDING_MAX) {
-		tv_pending_reads[idx].bdev = bdev;
-		tv_pending_reads[idx].sector = sector;
-		tv_pending_reads[idx].mirror_sector = mirror_sector;
-		tv_pending_reads[idx].size = size;
-		tv_pending_reads[idx].mirror_disk = mirror_disk;
-		tv_pending_count++;
+	idx = (pcpu->head + pcpu->count) % 64;
+	if (pcpu->count < 64) {
+		pcpu->entries[idx].bdev = bdev;
+		pcpu->entries[idx].sector = sector;
+		pcpu->entries[idx].mirror_sector = mirror_sector;
+		pcpu->entries[idx].size = size;
+		pcpu->entries[idx].mirror_disk = mirror_disk;
+		pcpu->count++;
 	} else {
-		pr_warn_once("tieredvol: pending-read array full, dropping entry\n");
+		pr_warn_once("tieredvol: per-cpu pending-read full, dropping entry\n");
 	}
-	spin_unlock_irqrestore(&tv_pending_lock, flags);
 }
 EXPORT_SYMBOL_GPL(tv_pending_add);
 
 int tv_pending_find_and_remove(struct block_device *bdev, sector_t sector,
 			       unsigned int size, sector_t *mirror_sector_out)
 {
-	unsigned long flags;
 	int mirror_disk = -1;
-	unsigned int i;
+	int cpu;
 
-	spin_lock_irqsave(&tv_pending_lock, flags);
-	for (i = 0; i < tv_pending_count; i++) {
-		unsigned int idx = (tv_pending_head + i) % TV_PENDING_MAX;
-		struct tv_pending_read *pr = &tv_pending_reads[idx];
+	for_each_possible_cpu(cpu) {
+		struct tv_pending_read_cpu *pcpu = per_cpu_ptr(&tv_pcpu_reads, cpu);
+		unsigned int i;
 
-		if (pr->bdev == bdev && pr->sector == sector &&
-		    pr->size == size) {
-			unsigned int j;
+		for (i = 0; i < pcpu->count; i++) {
+			unsigned int idx = (pcpu->head + i) % 64;
+			struct tv_pending_read_entry *pr = &pcpu->entries[idx];
 
-			mirror_disk = pr->mirror_disk;
-			if (mirror_sector_out)
-				*mirror_sector_out = pr->mirror_sector;
-			for (j = i; j + 1 < tv_pending_count; j++) {
-				unsigned int next =
-					(tv_pending_head + j + 1) %
-					TV_PENDING_MAX;
+			if (pr->bdev == bdev && pr->sector == sector &&
+			    pr->size == size) {
+				unsigned int j;
 
-				tv_pending_reads[(tv_pending_head + j) %
-						 TV_PENDING_MAX] =
-					tv_pending_reads[next];
+				mirror_disk = pr->mirror_disk;
+				if (mirror_sector_out)
+					*mirror_sector_out = pr->mirror_sector;
+				for (j = i; j + 1 < pcpu->count; j++) {
+					unsigned int next =
+						(pcpu->head + j + 1) % 64;
+
+					pcpu->entries[(pcpu->head + j) % 64] =
+						pcpu->entries[next];
+				}
+				pcpu->count--;
+				goto found;
 			}
-			tv_pending_count--;
-			break;
 		}
 	}
-	spin_unlock_irqrestore(&tv_pending_lock, flags);
+found:
 	return mirror_disk;
 }
 EXPORT_SYMBOL_GPL(tv_pending_find_and_remove);
+/* ---- Pending-write tracking (per-CPU, lockless) ---- */
 
-/* ---- Pending-write tracking (1b) ---- */
-
-struct tv_pending_write {
-	struct block_device *bdev;
-	sector_t sector;
-	unsigned int size;
-};
-
-static struct tv_pending_write tv_pending_writes[TV_PENDING_MAX];
-static unsigned int tv_pw_head;
-static unsigned int tv_pw_count;
-static DEFINE_SPINLOCK(tv_pw_lock);
+static DEFINE_PER_CPU(struct tv_pending_write_cpu, tv_pcpu_writes);
 
 void tv_pw_add(struct block_device *bdev, sector_t sector, unsigned int size)
 {
-	unsigned long flags;
+	struct tv_pending_write_cpu *pcpu = this_cpu_ptr(&tv_pcpu_writes);
 	unsigned int idx;
 
-	spin_lock_irqsave(&tv_pw_lock, flags);
-	idx = (tv_pw_head + tv_pw_count) % TV_PENDING_MAX;
-	if (tv_pw_count < TV_PENDING_MAX) {
-		tv_pending_writes[idx].bdev = bdev;
-		tv_pending_writes[idx].sector = sector;
-		tv_pending_writes[idx].size = size;
-		tv_pw_count++;
+	idx = (pcpu->head + pcpu->count) % 64;
+	if (pcpu->count < 64) {
+		pcpu->entries[idx].bdev = bdev;
+		pcpu->entries[idx].sector = sector;
+		pcpu->entries[idx].size = size;
+		pcpu->count++;
 	} else {
-		pr_warn_once("tieredvol: pending-write array full, dropping entry\n");
+		pr_warn_once("tieredvol: per-cpu pending-write full, dropping entry\n");
 	}
-	spin_unlock_irqrestore(&tv_pw_lock, flags);
 }
 EXPORT_SYMBOL_GPL(tv_pw_add);
 
 static void tv_pw_remove(struct block_device *bdev, sector_t sector,
 			  unsigned int size)
 {
-	unsigned long flags;
-	unsigned int i;
+	int cpu;
 
-	spin_lock_irqsave(&tv_pw_lock, flags);
-	for (i = 0; i < tv_pw_count; i++) {
-		unsigned int idx = (tv_pw_head + i) % TV_PENDING_MAX;
-		struct tv_pending_write *pw = &tv_pending_writes[idx];
+	for_each_possible_cpu(cpu) {
+		struct tv_pending_write_cpu *pcpu = per_cpu_ptr(&tv_pcpu_writes, cpu);
+		unsigned int i;
 
-		if (pw->bdev == bdev && pw->sector == sector &&
-		    pw->size == size) {
-			unsigned int j;
+		for (i = 0; i < pcpu->count; i++) {
+			unsigned int idx = (pcpu->head + i) % 64;
+			struct tv_pending_write_entry *pw = &pcpu->entries[idx];
 
-			for (j = i; j + 1 < tv_pw_count; j++) {
-				unsigned int next =
-					(tv_pw_head + j + 1) % TV_PENDING_MAX;
+			if (pw->bdev == bdev && pw->sector == sector &&
+			    pw->size == size) {
+				unsigned int j;
 
-				tv_pending_writes[(tv_pw_head + j) %
-						 TV_PENDING_MAX] =
-					tv_pending_writes[next];
+				for (j = i; j + 1 < pcpu->count; j++) {
+					unsigned int next =
+						(pcpu->head + j + 1) % 64;
+
+					pcpu->entries[(pcpu->head + j) % 64] =
+						pcpu->entries[next];
+				}
+				pcpu->count--;
+				return;
 			}
-			tv_pw_count--;
-			break;
 		}
 	}
-	spin_unlock_irqrestore(&tv_pw_lock, flags);
 }
 
 static bool tv_pw_is_pending(struct block_device *bdev, sector_t sector,
 			      unsigned int size)
 {
-	unsigned long flags;
-	bool found = false;
-	unsigned int i;
+	int cpu;
 
-	spin_lock_irqsave(&tv_pw_lock, flags);
-	for (i = 0; i < tv_pw_count; i++) {
-		unsigned int idx = (tv_pw_head + i) % TV_PENDING_MAX;
-		struct tv_pending_write *pw = &tv_pending_writes[idx];
+	for_each_possible_cpu(cpu) {
+		struct tv_pending_write_cpu *pcpu = per_cpu_ptr(&tv_pcpu_writes, cpu);
+		unsigned int i;
 
-		if (pw->bdev == bdev && pw->sector == sector &&
-		    pw->size == size) {
-			found = true;
-			break;
+		for (i = 0; i < pcpu->count; i++) {
+			unsigned int idx = (pcpu->head + i) % 64;
+			struct tv_pending_write_entry *pw = &pcpu->entries[idx];
+
+			if (pw->bdev == bdev && pw->sector == sector &&
+			    pw->size == size)
+				return true;
 		}
 	}
-	spin_unlock_irqrestore(&tv_pw_lock, flags);
-	return found;
+	return false;
 }
 
 /* ---- Mirror I/O completion ---- */
@@ -188,7 +162,7 @@ void tv_mirror_end_io(struct bio *bio)
 		atomic64_inc(&pwc->ctx->mirror.mirror_write_ops);
 
 	tv_pw_remove(pwc->bdev, pwc->sector, pwc->size);
-	kfree(pwc);
+	mempool_free(pwc, pwc->ctx->mirror_pw_pool);
 	bio_put(bio);
 }
 EXPORT_SYMBOL_GPL(tv_mirror_end_io);
@@ -211,7 +185,7 @@ static void tv_mirror_retry_end_io(struct bio *bio)
 	bio_endio(orig_bio);
 	bio_put(orig_bio);
 	bio_put(bio);
-	kfree(rc);
+	mempool_free(rc, rc->ctx->retry_ctx_pool);
 }
 
 /* ---- Read retry work ---- */
@@ -252,7 +226,7 @@ fail:
 	rc->orig_bio->bi_status = BLK_STS_IOERR;
 	bio_endio(rc->orig_bio);
 	bio_put(rc->orig_bio);
-	kfree(rc);
+	mempool_free(rc, rc->ctx->retry_ctx_pool);
 }
 
 /* ---- DM end_io handler ---- */
@@ -316,9 +290,9 @@ int tieredvol_end_io(struct dm_target *ti, struct bio *bio, blk_status_t *error)
 			    mirror < ctx->ndisks) {
 				struct tv_retry_ctx *rc;
 
-				rc = kmalloc(sizeof(*rc),
+			rc = mempool_alloc(ctx->retry_ctx_pool,
 					     GFP_ATOMIC);
-				if (rc) {
+			if (rc) {
 					INIT_DELAYED_WORK(
 						&rc->dwork,
 						tv_read_retry_work);
