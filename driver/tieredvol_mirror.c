@@ -265,7 +265,10 @@ int tieredvol_end_io(struct dm_target *ti, struct bio *bio, blk_status_t *error)
 		int i;
 
 		for (i = 0; i < ctx->ndisks; i++) {
-			if (bio->bi_bdev == ctx->devs[i]->bdev) {
+			if (bio->bi_bdev != ctx->devs[i]->bdev)
+				continue;
+
+			{
 				int errs;
 
 				errs = atomic_inc_return(&ctx->deg.error_count[i]);
@@ -285,6 +288,7 @@ int tieredvol_end_io(struct dm_target *ti, struct bio *bio, blk_status_t *error)
 					       "DEGRADED err=%d", errs);
 					schedule_work(&ctx->trigger_event);
 				}
+			}
 
 			if (bio_data_dir(bio) == READ) {
 				int mirror;
@@ -297,7 +301,7 @@ int tieredvol_end_io(struct dm_target *ti, struct bio *bio, blk_status_t *error)
 					&mirror_sector);
 
 				if (mirror >= 0 &&
-			    mirror < ctx->ndisks) {
+				    mirror < ctx->ndisks) {
 					struct tv_retry_ctx *rc;
 
 					rc = kmalloc(sizeof(*rc),
@@ -313,16 +317,16 @@ int tieredvol_end_io(struct dm_target *ti, struct bio *bio, blk_status_t *error)
 							bio->bi_iter.bi_size;
 						rc->mirror_disk =
 							mirror;
-					rc->retries = 32;
-					bio_get(bio);
-					schedule_delayed_work(
-						&rc->dwork, 0);
-					return 1;
+						rc->retries = 32;
+						bio_get(bio);
+						schedule_delayed_work(
+							&rc->dwork, 0);
+						return 1;
 					}
 				}
 			}
-				break;
-			}
+
+			break;
 		}
 	} else if (bio_data_dir(bio) == READ) {
 		tv_pending_find_and_remove(bio->bi_bdev,

@@ -617,6 +617,65 @@ sudo ./tiered_setup --destroy --name tv_integrity
 
 ---
 
+## 實驗結果
+
+**日期：** 2026-07-27
+**環境：** B85, i5-4570, Linux 6.14.0-27-generic, TieredVol v5.0.0
+**測試碟：** nvme0n1 (P3 Plus 931G), sdb (MX500 465G), sdc (WD Blue 232G), sdd (BX100 256G)
+
+---
+
+### 實驗 1 結果：TieredVol vs LVM（效能驗證）
+
+| 組態 | Write MB/s | Read MB/s |
+|------|-----------|-----------|
+| TieredVol (weighted) | 1126 | 1415 |
+| LVM 1M stripe | 1085 | 1302 |
+| TieredVol 勝 | **+3.8%** | **+8.7%** |
+
+**結論：** TieredVol 加權條帶化在異質碟上優於 LVM 固定條帶化，特別是在 read 方向（+8.7%）。
+
+---
+
+### 實驗 2 結果：Mirror 讀取回退（容錯驗證）
+
+**組態：** 2 碟（failio_sdb primary + sdd dedicated mirror），1-disk segment，mirror 非 stripe participant。
+
+| 測試 | 結果 |
+|------|------|
+| 10MB 寫入後完整讀回 | ✅ MD5 一致 |
+| Fault inject 後 10MB 讀回 | ✅ MD5 一致 |
+| 10/10 chunks 逐一比對 | ✅ 全部正確 |
+| Offset 2MB 讀回 | ✅ MD5 一致 |
+
+**重要修正：** Mirror target 不得是 stripe participant。初始 config 使用 sdd 同時做 stripe disk 和 mirror target，導致 mirror data 被 primary stripe data 覆蓋（地址重疊）。已加入 driver 驗證：`mirror_disk ∈ stripe_disks` 時拒絕設定。
+
+---
+
+### 實驗 3 結果：Adaptive vs Static（調度策略驗證）
+
+| 模式 | Static (MB/s) | Adaptive (MB/s) | 差距 |
+|------|--------------|----------------|------|
+| Sequential write | ~5000-5200 | ~5100-5200 | ~0% |
+| Mixed (bg load on sdb) | 1969, 2116, 2032 (avg 2039) | 2151, 2370, 2246 (avg 2256) | **+10.6%** |
+
+**結論：** Adaptive EMA 策略在混合 I/O 負載下比 Static 策略快 ~10.6%，證明即時負載感知調度有效。在純 sequential write（無競爭）時兩者相當。
+
+---
+
+### 實驗 4 結果：資料完整性（穩定性驗證）
+
+| 測試 | 結果 |
+|------|------|
+| Sequential write 1GB + verify (crc32) | ✅ PASS |
+| Random read+write 256MB + verify | ✅ PASS |
+| Small I/O (512B) 128MB + verify | ✅ PASS |
+| Cross-segment boundary 200G offset + verify | ✅ PASS |
+
+**結論：** 所有 fio `--verify=crc32` 測試通過，TieredVol 無靜態資料損壞（silent corruption）。
+
+---
+
 ## 常見問題
 
 ### Q: 為什麼不用 tiered_io？
