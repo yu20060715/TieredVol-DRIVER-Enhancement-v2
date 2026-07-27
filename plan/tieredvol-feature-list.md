@@ -204,7 +204,7 @@
 
 ### `show_log`（17）
 - 非破坏性读取日志（kfifo_out+kfifo_in）
-- 实现：`tieredvol_message.c:475-514`
+- 实现：`tieredvol_message.c:487-526`
 
 ### `clear_log`（18）
 - 重置日志 ring
@@ -327,7 +327,7 @@
 
 ### #63 DM 查询
 - show_log（非破坏性）/ clear_log（重置）
-- 实现：`tieredvol_message.c:475-514`
+- 实现：`tieredvol_message.c:487-526`
 - 内核参考：`dm-dust.c`, `dm-log-writes.c`
 
 ---

@@ -180,7 +180,7 @@ sudo make install       # Install to /usr/local/bin/
 ## Project Structure
 
 ```
-TieredVol-DRIVER-Enhancement-v2/
+TieredVol-DRIVER-Enhancement/
 ├── README.md
 ├── VERIFY.md                        # Verification results + benchmarks
 ├── Makefile
@@ -264,8 +264,8 @@ Key features:
 - Error detection with per-disk error_count and degraded mode
 
 Key constants:
-- `TV_MAX_DISKS` = 8
-- `TV_MAX_SEGS` = 8
+- `TV_MAX_DISKS` = 16
+- `TV_MAX_SEGS` = 16
 
 ### Metadata Format
 

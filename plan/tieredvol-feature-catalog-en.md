@@ -522,9 +522,9 @@ Runtime control interface via `dmsetup message`. All commands dispatched in `tv_
 
 > Non-destructive log ring read: uses `kfifo_out()` + `kfifo_in()` to copy entries and restore, consuming nothing.
 
-**Implementation:** `tieredvol_message.c:475-514`. Under spinlock, uses `kfifo_out()` to drain entries to temporary array, formats output, then writes back via `kfifo_in()` preserving original ring contents.
+**Implementation:** `tieredvol_message.c:487-526`. Under spinlock, uses `kfifo_out()` to drain entries to temporary array, formats output, then writes back via `kfifo_in()` preserving original ring contents.
 
-**Key APIs:** `kfifo_out()`, `kfifo_in()`, `spin_lock_irqsave()`
+**Key APIs:** `kfifo_out()`, `kfifo_in()`, `raw_spin_lock_irqsave()`
 
 ---
 
@@ -805,10 +805,10 @@ Kernel-space ring buffer logging I/O, stale, mirror, and config events with time
 > Real-time log query via `show_log` (non-destructive read using kfifo_out+kfifo_in) and `clear_log` (reset ring buffer).
 
 **Implementation:** `tieredvol_message.c`.
-- `show_log` (:475-514): Under raw_spinlock, uses `kfifo_out()` to drain entries to temporary array, prints each entry to dmesg in format `LOG {ERR|WRN|INF} {I/O|STALE|RCVR|MIRR|CONF}: <msg>`, then writes back via `kfifo_in()` preserving ring contents.
+- `show_log` (:487-526): Under raw_spinlock, uses `kfifo_out()` to drain entries to temporary array, prints each entry to dmesg in format `LOG {ERR|WRN|INF} {I/O|STALE|RCVR|MIRR|CONF}: <msg>`, then writes back via `kfifo_in()` preserving ring contents.
 - `clear_log`: Calls `kfifo_reset()` under raw_spinlock.
 
-**Key APIs:** `kfifo_out()`, `kfifo_in()`, `kfifo_reset()`, `DMINFO()`
+**Key APIs:** `kfifo_out()`, `kfifo_in()`, `kfifo_reset()`, `raw_spin_lock_irqsave()`, `DMINFO()`
 
 **References:**
 1. `drivers/md/dm-dust.c` — DM message query/result pattern

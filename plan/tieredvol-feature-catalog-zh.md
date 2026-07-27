@@ -522,9 +522,9 @@ Stale 偵測識別已停止回應 I/O 的碟。碟在可配置超時後被標記
 
 > 非破壞性讀取日誌 ring：使用 `kfifo_out()` + `kfifo_in()` 複製條目後還原，不消費任何條目。
 
-**實現方法：** `tieredvol_message.c:475-514`。在自旋鎖下使用 `kfifo_out()` 排出條目到臨時陣列，格式化輸出後透過 `kfifo_in()` 寫回 ring，保持原始內容不變。
+**實現方法：** `tieredvol_message.c:487-526`。在自旋鎖下使用 `kfifo_out()` 排出條目到臨時陣列，格式化輸出後透過 `kfifo_in()` 寫回 ring，保持原始內容不變。
 
-**核心 API：** `kfifo_out()`, `kfifo_in()`, `spin_lock_irqsave()`
+**核心 API：** `kfifo_out()`, `kfifo_in()`, `raw_spin_lock_irqsave()`
 
 ---
 
@@ -805,10 +805,10 @@ Stale 偵測識別已停止回應 I/O 的碟。碟在可配置超時後被標記
 > 透過 `show_log`（非破壞性讀取，使用 kfifo_out+kfifo_in）和 `clear_log`（重置環形緩衝區）進行即時日誌查詢。
 
 **實現方法：** `tieredvol_message.c`。
-- `show_log`（:475-514）：在 raw_spinlock 下使用 `kfifo_out()` 排出條目到臨時陣列，以格式 `LOG {ERR|WRN|INF} {I/O|STALE|RCVR|MIRR|CONF}: <msg>` 將每條目列印到 dmesg，然後透過 `kfifo_in()` 寫回 ring，保持內容不變。
+- `show_log`（:487-526）：在 raw_spinlock 下使用 `kfifo_out()` 排出條目到臨時陣列，以格式 `LOG {ERR|WRN|INF} {I/O|STALE|RCVR|MIRR|CONF}: <msg>` 將每條目列印到 dmesg，然後透過 `kfifo_in()` 寫回 ring，保持內容不變。
 - `clear_log`：在 raw_spinlock 下呼叫 `kfifo_reset()`。
 
-**核心 API：** `kfifo_out()`, `kfifo_in()`, `kfifo_reset()`, `DMINFO()`
+**核心 API：** `kfifo_out()`, `kfifo_in()`, `kfifo_reset()`, `raw_spin_lock_irqsave()`, `DMINFO()`
 
 **參考文獻：**
 1. `drivers/md/dm-dust.c` — DM message 查詢/結果模式
