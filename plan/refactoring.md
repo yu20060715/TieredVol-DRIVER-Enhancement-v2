@@ -249,7 +249,7 @@ struct tv_msg_handler {
 
 **驗證:** `make module` + `make test` + `test_comprehensive.sh`
 **風險:** 低-中（純重構）
-**狀態:** [ ] 待執行
+**狀態:** [x] 完成 (81/81 unit tests pass)
 
 ---
 
