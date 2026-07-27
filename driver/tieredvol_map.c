@@ -150,6 +150,22 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 	}
 
 	if (best_disk < 0) {
+		/* Fallback: prefer non-stale/non-degraded disks */
+		for (i = 0; i < (int)seg->disk_count; i++) {
+			u32 d = seg->disk_index[i];
+
+			if (d >= (u32)ndisks)
+				continue;
+			if (stale && stale[d])
+				continue;
+			if (degraded && degraded[d])
+				continue;
+			best_disk = i;
+			break;
+		}
+	}
+	if (best_disk < 0) {
+		/* Last resort: accept any valid disk (even stale/degraded) */
 		for (i = 0; i < (int)seg->disk_count; i++) {
 			u32 d = seg->disk_index[i];
 

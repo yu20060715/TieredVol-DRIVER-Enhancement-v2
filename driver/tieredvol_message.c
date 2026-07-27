@@ -17,6 +17,8 @@
 
 /* ---- Metadata write-back (1d) ---- */
 
+static DEFINE_MUTEX(tv_save_mutex);
+
 static int tv_metadata_save_kernel(struct tieredvol_ctx *ctx)
 {
 	struct file *f;
@@ -30,9 +32,13 @@ static int tv_metadata_save_kernel(struct tieredvol_ctx *ctx)
 	if (!ctx->config_path[0])
 		return -ENOENT;
 
+	mutex_lock(&tv_save_mutex);
+
 	buf = kmalloc(65536, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
+	if (!buf) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
 
 	off += scnprintf(buf + off, 65536 - off, "[weighted_striping]\n");
 	off += scnprintf(buf + off, 65536 - off, "version=%u\n",
@@ -118,7 +124,8 @@ static int tv_metadata_save_kernel(struct tieredvol_ctx *ctx)
 		pr_err("tieredvol: save failed to open %s: %ld\n",
 		       ctx->config_path, PTR_ERR(f));
 		kfree(buf);
-		return PTR_ERR(f);
+		ret = PTR_ERR(f);
+		goto out_unlock;
 	}
 
 	pos = 0;
@@ -129,7 +136,8 @@ static int tv_metadata_save_kernel(struct tieredvol_ctx *ctx)
 		pr_err("tieredvol: save write error %d (wrote %lld of %d)\n",
 		       ret, pos, off);
 		kfree(buf);
-		return ret < 0 ? ret : -EIO;
+		ret = ret < 0 ? ret : -EIO;
+		goto out_unlock;
 	}
 
 	tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "metadata saved crc=0x%08x",
@@ -137,7 +145,11 @@ static int tv_metadata_save_kernel(struct tieredvol_ctx *ctx)
 	pr_info("tieredvol: metadata saved crc=0x%08x to %s\n", crc,
 		ctx->config_path);
 	kfree(buf);
-	return 0;
+	ret = 0;
+
+out_unlock:
+	mutex_unlock(&tv_save_mutex);
+	return ret;
 }
 
 /* ---- Message handler functions (Phase 3) ---- */

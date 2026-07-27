@@ -473,8 +473,7 @@ static void tieredvol_status(struct dm_target *ti, status_type_t type,
 
 			if (ctx->deg.degraded[i])
 				status = 'D';
-			else if (ctx->deg.error_count &&
-				 atomic_read(&ctx->deg.error_count[i]))
+			else if (atomic_read(&ctx->deg.error_count[i]))
 				status = 'E';
 			else
 				status = 'A';
@@ -592,4 +591,4 @@ module_exit(tieredvol_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("TieredVol");
 MODULE_DESCRIPTION("Weighted striped dm target for tiered storage");
-MODULE_VERSION("4.6.0");
+MODULE_VERSION("5.0.0");

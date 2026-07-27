@@ -176,13 +176,19 @@ void tv_ts_submit(int disk_idx, sector_t sector, unsigned int size)
 		return;
 
 	spin_lock_irqsave(&tv_ts_lock_arr[disk_idx], flags);
-	idx = (tv_ts_rings[disk_idx].head + tv_ts_rings[disk_idx].count) % 256;
 	if (tv_ts_rings[disk_idx].count < 256) {
-		tv_ts_rings[disk_idx].entries[idx].sector = sector;
-		tv_ts_rings[disk_idx].entries[idx].size = size;
-		tv_ts_rings[disk_idx].entries[idx].submit_ns = ktime_get_ns();
+		idx = (tv_ts_rings[disk_idx].head +
+		       tv_ts_rings[disk_idx].count) % 64;
 		tv_ts_rings[disk_idx].count++;
+	} else {
+		/* Ring full: overwrite oldest entry (advance head) */
+		idx = tv_ts_rings[disk_idx].head;
+		tv_ts_rings[disk_idx].head =
+			(tv_ts_rings[disk_idx].head + 1) % 64;
 	}
+	tv_ts_rings[disk_idx].entries[idx].sector = sector;
+	tv_ts_rings[disk_idx].entries[idx].size = size;
+	tv_ts_rings[disk_idx].entries[idx].submit_ns = ktime_get_ns();
 	spin_unlock_irqrestore(&tv_ts_lock_arr[disk_idx], flags);
 }
 EXPORT_SYMBOL_GPL(tv_ts_submit);
@@ -198,15 +204,15 @@ u64 tv_ts_complete(int disk_idx, sector_t sector, unsigned int size)
 
 	spin_lock_irqsave(&tv_ts_lock_arr[disk_idx], flags);
 	for (i = 0; i < tv_ts_rings[disk_idx].count; i++) {
-		unsigned int idx = (tv_ts_rings[disk_idx].head + i) % 256;
+		unsigned int idx = (tv_ts_rings[disk_idx].head + i) % 64;
 
 		if (tv_ts_rings[disk_idx].entries[idx].sector == sector &&
 		    tv_ts_rings[disk_idx].entries[idx].size == size) {
 			delta = ktime_get_ns() - tv_ts_rings[disk_idx].entries[idx].submit_ns;
 			for (; i + 1 < tv_ts_rings[disk_idx].count; i++) {
-				unsigned int next = (tv_ts_rings[disk_idx].head + i + 1) % 256;
+				unsigned int next = (tv_ts_rings[disk_idx].head + i + 1) % 64;
 
-				tv_ts_rings[disk_idx].entries[(tv_ts_rings[disk_idx].head + i) % 256] =
+				tv_ts_rings[disk_idx].entries[(tv_ts_rings[disk_idx].head + i) % 64] =
 					tv_ts_rings[disk_idx].entries[next];
 			}
 			tv_ts_rings[disk_idx].count--;
