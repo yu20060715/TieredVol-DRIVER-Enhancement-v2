@@ -4,6 +4,7 @@
 #include <linux/types.h>
 #include <linux/device-mapper.h>
 #include <linux/atomic.h>
+#include <linux/rcupdate.h>
 #include <linux/ktime.h>
 #include <linux/timer.h>
 #include <linux/bio.h>
@@ -61,10 +62,10 @@ enum tv_policy {
 
 struct tv_io_stats {
 	atomic_t in_flight_bytes[TV_MAX_DISKS];
-	u64 total_write_bytes[TV_MAX_DISKS];
-	u64 total_read_bytes[TV_MAX_DISKS];
-	u64 total_write_ops[TV_MAX_DISKS];
-	u64 total_read_ops[TV_MAX_DISKS];
+	atomic64_t total_write_bytes[TV_MAX_DISKS];
+	atomic64_t total_read_bytes[TV_MAX_DISKS];
+	atomic64_t total_write_ops[TV_MAX_DISKS];
+	atomic64_t total_read_ops[TV_MAX_DISKS];
 };
 
 struct tv_adaptive_state {
@@ -82,9 +83,9 @@ struct tv_adaptive_state {
 };
 
 struct tv_mirror_stats {
-	u64 mirror_write_bytes;
-	u64 mirror_write_ops;
-	u64 mirror_errors;
+	atomic64_t mirror_write_bytes;
+	atomic64_t mirror_write_ops;
+	atomic64_t mirror_errors;
 };
 
 struct tv_rebuild_state {
@@ -112,7 +113,6 @@ struct tieredvol_ctx {
 	int ndisks;
 	sector_t min_chunk_sectors;
 	sector_t stripe_sectors;
-	bool adaptive_enabled;
 	struct tv_io_stats io;
 	struct tv_degradation deg;
 	struct tv_adaptive_state adaptive;
@@ -130,7 +130,7 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 					    u64 *ema_load, bool *stale,
 					    bool *degraded,
 					    int ndisks,
-					    u64 *total_write_bytes,
+					    atomic64_t *total_write_bytes,
 					    u32 wear_bias,
 					    u32 chunk_size);
 struct tieredvol_map tv_map_logical_random(u64 logical,
@@ -208,7 +208,7 @@ void tv_sysfs_exit(void);
 int tieredvol_message(struct dm_target *ti, unsigned int argc,
 		      char **argv, char *result, unsigned int maxlen);
 
-/* ---- Global active context ---- */
-extern struct tieredvol_ctx *tv_active_ctx;
+/* ---- Global active context (RCU-protected) ---- */
+extern struct tieredvol_ctx __rcu *tv_active_ctx;
 
 #endif

@@ -3,10 +3,12 @@
  * tieredvol_sysfs.c — sysfs attributes at /sys/kernel/tieredvol/
  *
  * Extracted from tieredvol_core.c in Phase 1 refactoring.
+ * All tv_active_ctx access is RCU-protected to prevent use-after-free.
  */
 #include <linux/module.h>
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
+#include <linux/rcupdate.h>
 #include "tieredvol.h"
 
 static struct kobject *tv_kobj;
@@ -14,90 +16,139 @@ static struct kobject *tv_kobj;
 static ssize_t policy_show(struct kobject *kobj, struct kobj_attribute *attr,
 			   char *buf)
 {
-	struct tieredvol_ctx *ctx = tv_active_ctx;
+	struct tieredvol_ctx *ctx;
+	ssize_t ret;
 
-	if (!ctx)
+	rcu_read_lock();
+	ctx = rcu_dereference(tv_active_ctx);
+	if (!ctx) {
+		rcu_read_unlock();
 		return -ENODEV;
-	return sysfs_emit(buf, "%s\n",
+	}
+	ret = sysfs_emit(buf, "%s\n",
 			  ctx->adaptive.policy == TV_POLICY_ADAPTIVE ?
 				  "adaptive" :
 			  ctx->adaptive.policy == TV_POLICY_RANDOM ?
 				  "random" :
 				  "static");
+	rcu_read_unlock();
+	return ret;
 }
 
 static ssize_t stale_ms_show(struct kobject *kobj, struct kobj_attribute *attr,
 			      char *buf)
 {
-	struct tieredvol_ctx *ctx = tv_active_ctx;
+	struct tieredvol_ctx *ctx;
+	ssize_t ret;
 
-	if (!ctx)
+	rcu_read_lock();
+	ctx = rcu_dereference(tv_active_ctx);
+	if (!ctx) {
+		rcu_read_unlock();
 		return -ENODEV;
-	return sysfs_emit(buf, "%llu\n",
+	}
+	ret = sysfs_emit(buf, "%llu\n",
 			  ctx->adaptive.stale_after_ns / 1000000ULL);
+	rcu_read_unlock();
+	return ret;
 }
 
 static ssize_t stale_ms_store(struct kobject *kobj, struct kobj_attribute *attr,
 			       const char *buf, size_t count)
 {
-	struct tieredvol_ctx *ctx = tv_active_ctx;
+	struct tieredvol_ctx *ctx;
 	u32 ms;
 
-	if (!ctx)
+	rcu_read_lock();
+	ctx = rcu_dereference(tv_active_ctx);
+	if (!ctx) {
+		rcu_read_unlock();
 		return -ENODEV;
-	if (kstrtou32(buf, 10, &ms))
+	}
+	if (kstrtou32(buf, 10, &ms)) {
+		rcu_read_unlock();
 		return -EINVAL;
+	}
 	ctx->adaptive.stale_after_ns = (u64)ms * 1000000ULL;
+	rcu_read_unlock();
 	return count;
 }
 
 static ssize_t wear_bias_show(struct kobject *kobj, struct kobj_attribute *attr,
 			       char *buf)
 {
-	struct tieredvol_ctx *ctx = tv_active_ctx;
+	struct tieredvol_ctx *ctx;
+	ssize_t ret;
 
-	if (!ctx)
+	rcu_read_lock();
+	ctx = rcu_dereference(tv_active_ctx);
+	if (!ctx) {
+		rcu_read_unlock();
 		return -ENODEV;
-	return sysfs_emit(buf, "%u\n", ctx->adaptive.wear_bias);
+	}
+	ret = sysfs_emit(buf, "%u\n", ctx->adaptive.wear_bias);
+	rcu_read_unlock();
+	return ret;
 }
 
 static ssize_t wear_bias_store(struct kobject *kobj,
 			       struct kobj_attribute *attr, const char *buf,
 			       size_t count)
 {
-	struct tieredvol_ctx *ctx = tv_active_ctx;
+	struct tieredvol_ctx *ctx;
 	u32 bias;
 
-	if (!ctx)
+	rcu_read_lock();
+	ctx = rcu_dereference(tv_active_ctx);
+	if (!ctx) {
+		rcu_read_unlock();
 		return -ENODEV;
-	if (kstrtou32(buf, 10, &bias) || bias > 1024)
+	}
+	if (kstrtou32(buf, 10, &bias) || bias > 1024) {
+		rcu_read_unlock();
 		return -EINVAL;
+	}
 	ctx->adaptive.wear_bias = bias;
+	rcu_read_unlock();
 	return count;
 }
 
 static ssize_t ema_shift_show(struct kobject *kobj, struct kobj_attribute *attr,
 			       char *buf)
 {
-	struct tieredvol_ctx *ctx = tv_active_ctx;
+	struct tieredvol_ctx *ctx;
+	ssize_t ret;
 
-	if (!ctx)
+	rcu_read_lock();
+	ctx = rcu_dereference(tv_active_ctx);
+	if (!ctx) {
+		rcu_read_unlock();
 		return -ENODEV;
-	return sysfs_emit(buf, "%u\n", ctx->adaptive.ema_weight_shift);
+	}
+	ret = sysfs_emit(buf, "%u\n", ctx->adaptive.ema_weight_shift);
+	rcu_read_unlock();
+	return ret;
 }
 
 static ssize_t ema_shift_store(struct kobject *kobj,
 			       struct kobj_attribute *attr, const char *buf,
 			       size_t count)
 {
-	struct tieredvol_ctx *ctx = tv_active_ctx;
+	struct tieredvol_ctx *ctx;
 	u32 shift;
 
-	if (!ctx)
+	rcu_read_lock();
+	ctx = rcu_dereference(tv_active_ctx);
+	if (!ctx) {
+		rcu_read_unlock();
 		return -ENODEV;
-	if (kstrtou32(buf, 10, &shift) || shift > 10)
+	}
+	if (kstrtou32(buf, 10, &shift) || shift > 10) {
+		rcu_read_unlock();
 		return -EINVAL;
+	}
 	ctx->adaptive.ema_weight_shift = shift;
+	rcu_read_unlock();
 	return count;
 }
 
@@ -121,28 +172,39 @@ static ssize_t loglevel_store(struct kobject *kobj, struct kobj_attribute *attr,
 static ssize_t disk_count_show(struct kobject *kobj,
 				struct kobj_attribute *attr, char *buf)
 {
-	struct tieredvol_ctx *ctx = tv_active_ctx;
+	struct tieredvol_ctx *ctx;
+	ssize_t ret;
 
-	if (!ctx)
+	rcu_read_lock();
+	ctx = rcu_dereference(tv_active_ctx);
+	if (!ctx) {
+		rcu_read_unlock();
 		return -ENODEV;
-	return sysfs_emit(buf, "%d\n", ctx->ndisks);
+	}
+	ret = sysfs_emit(buf, "%d\n", ctx->ndisks);
+	rcu_read_unlock();
+	return ret;
 }
 
 static ssize_t status_show(struct kobject *kobj, struct kobj_attribute *attr,
 			    char *buf)
 {
-	struct tieredvol_ctx *ctx = tv_active_ctx;
+	struct tieredvol_ctx *ctx;
 	int i, off = 0;
 
-	if (!ctx)
+	rcu_read_lock();
+	ctx = rcu_dereference(tv_active_ctx);
+	if (!ctx) {
+		rcu_read_unlock();
 		return -ENODEV;
+	}
 
 	off += sysfs_emit_at(buf, off,
 			     "policy=%d mirror=%llu/%llu err=%llu\n",
 			     ctx->adaptive.policy,
-			     ctx->mirror.mirror_write_ops,
-			     ctx->mirror.mirror_write_bytes,
-			     ctx->mirror.mirror_errors);
+			     atomic64_read(&ctx->mirror.mirror_write_ops),
+			     atomic64_read(&ctx->mirror.mirror_write_bytes),
+			     atomic64_read(&ctx->mirror.mirror_errors));
 
 	for (i = 0; i < ctx->ndisks; i++) {
 		off += sysfs_emit_at(
@@ -151,13 +213,14 @@ static ssize_t status_show(struct kobject *kobj, struct kobj_attribute *attr,
 			ctx->meta.disk_names[i],
 			atomic_read(&ctx->deg.error_count[i]),
 			ctx->deg.degraded[i] ? "DEGRADED" : "active",
-			ctx->io.total_read_ops[i],
-			ctx->io.total_read_bytes[i],
-			ctx->io.total_write_ops[i],
-			ctx->io.total_write_bytes[i],
+			atomic64_read(&ctx->io.total_read_ops[i]),
+			atomic64_read(&ctx->io.total_read_bytes[i]),
+			atomic64_read(&ctx->io.total_write_ops[i]),
+			atomic64_read(&ctx->io.total_write_bytes[i]),
 			ctx->adaptive.stale[i],
 			ctx->adaptive.ema_load[i]);
 	}
+	rcu_read_unlock();
 	return off;
 }
 

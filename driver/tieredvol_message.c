@@ -30,68 +30,68 @@ static int tv_metadata_save_kernel(struct tieredvol_ctx *ctx)
 	if (!ctx->config_path[0])
 		return -ENOENT;
 
-	buf = kmalloc(4096, GFP_KERNEL);
+	buf = kmalloc(65536, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
 
-	off += scnprintf(buf + off, sizeof(buf) - off, "[weighted_striping]\n");
-	off += scnprintf(buf + off, sizeof(buf) - off, "version=%u\n",
+	off += scnprintf(buf + off, 65536 - off, "[weighted_striping]\n");
+	off += scnprintf(buf + off, 65536 - off, "version=%u\n",
 			  ctx->meta.version);
-	off += scnprintf(buf + off, sizeof(buf) - off, "chunk_size=%u\n",
+	off += scnprintf(buf + off, 65536 - off, "chunk_size=%u\n",
 			  ctx->meta.chunk_size);
-	off += scnprintf(buf + off, sizeof(buf) - off, "segment_count=%u\n",
+	off += scnprintf(buf + off, 65536 - off, "segment_count=%u\n",
 			  ctx->meta.segment_count);
-	off += scnprintf(buf + off, sizeof(buf) - off, "disk_count=%u\n",
+	off += scnprintf(buf + off, 65536 - off, "disk_count=%u\n",
 			  ctx->meta.disk_count);
 
 	for (u32 i = 0; i < ctx->meta.disk_count; i++)
-		off += scnprintf(buf + off, sizeof(buf) - off,
+		off += scnprintf(buf + off, 65536 - off,
 				 "disk%u_name=%s\n", i, ctx->meta.disk_names[i]);
 
 	for (u32 i = 0; i < ctx->meta.segment_count; i++) {
 		struct tieredvol_segment *seg = &ctx->meta.segments[i];
 
-		off += scnprintf(buf + off, sizeof(buf) - off,
+		off += scnprintf(buf + off, 65536 - off,
 				 "seg%u_begin=%llu\n", i, seg->logical_begin);
-		off += scnprintf(buf + off, sizeof(buf) - off,
+		off += scnprintf(buf + off, 65536 - off,
 				 "seg%u_end=%llu\n", i, seg->logical_end);
-		off += scnprintf(buf + off, sizeof(buf) - off,
+		off += scnprintf(buf + off, 65536 - off,
 				 "seg%u_count=%u\n", i, seg->disk_count);
 
-		off += scnprintf(buf + off, sizeof(buf) - off, "seg%u_disks=",
+		off += scnprintf(buf + off, 65536 - off, "seg%u_disks=",
 				 i);
 		for (u32 j = 0; j < seg->disk_count; j++)
-			off += scnprintf(buf + off, sizeof(buf) - off,
+			off += scnprintf(buf + off, 65536 - off,
 					 "%s%u", j ? "," : "", seg->disk_index[j]);
-		off += scnprintf(buf + off, sizeof(buf) - off, "\n");
+		off += scnprintf(buf + off, 65536 - off, "\n");
 
-		off += scnprintf(buf + off, sizeof(buf) - off, "seg%u_weight=",
+		off += scnprintf(buf + off, 65536 - off, "seg%u_weight=",
 				 i);
 		for (u32 j = 0; j < seg->disk_count; j++)
-			off += scnprintf(buf + off, sizeof(buf) - off,
+			off += scnprintf(buf + off, 65536 - off,
 					 "%s%u", j ? "," : "", seg->weight[j]);
-		off += scnprintf(buf + off, sizeof(buf) - off, "\n");
+		off += scnprintf(buf + off, 65536 - off, "\n");
 
-		off += scnprintf(buf + off, sizeof(buf) - off,
+		off += scnprintf(buf + off, 65536 - off,
 				 "seg%u_stripe=%llu\n", i, seg->stripe_size);
 		if (seg->mirror_enabled)
-			off += scnprintf(buf + off, sizeof(buf) - off,
+			off += scnprintf(buf + off, 65536 - off,
 					 "seg%u_mirror=%u\n", i,
 					 seg->mirror_disk);
 	}
 
-	off += scnprintf(buf + off, sizeof(buf) - off, "[runtime]\n");
-	off += scnprintf(buf + off, sizeof(buf) - off, "policy=%d\n",
+	off += scnprintf(buf + off, 65536 - off, "[runtime]\n");
+	off += scnprintf(buf + off, 65536 - off, "policy=%d\n",
 			  ctx->adaptive.policy);
-	off += scnprintf(buf + off, sizeof(buf) - off, "stale_ms=%llu\n",
+	off += scnprintf(buf + off, 65536 - off, "stale_ms=%llu\n",
 			  ctx->adaptive.stale_after_ns / 1000000ULL);
-	off += scnprintf(buf + off, sizeof(buf) - off, "ema_shift=%u\n",
+	off += scnprintf(buf + off, 65536 - off, "ema_shift=%u\n",
 			  ctx->adaptive.ema_weight_shift);
-	off += scnprintf(buf + off, sizeof(buf) - off, "wear_bias=%u\n",
+	off += scnprintf(buf + off, 65536 - off, "wear_bias=%u\n",
 			  ctx->adaptive.wear_bias);
 
 	crc = crc32c(0, buf, off);
-	off += scnprintf(buf + off, sizeof(buf) - off, "crc32=%u\n", crc);
+	off += scnprintf(buf + off, 65536 - off, "crc32=%u\n", crc);
 
 	scnprintf(bak_path, sizeof(bak_path), "%s.bak", ctx->config_path);
 
@@ -300,7 +300,7 @@ static int msg_show_adaptive(struct dm_target *ti, unsigned int argc,
 				" %s:load=%llu writes=%llu stale=%d",
 				ctx->meta.disk_names[i],
 				ctx->adaptive.ema_load[i],
-				ctx->io.total_write_bytes[i],
+				atomic64_read(&ctx->io.total_write_bytes[i]),
 				ctx->adaptive.stale[i]);
 	}
 	pr_info("tieredvol: %s\n", result);
@@ -319,7 +319,7 @@ static int msg_show_wear(struct dm_target *ti, unsigned int argc,
 		off += snprintf(result + off, maxlen - off,
 				" %s=%llu",
 				ctx->meta.disk_names[i],
-				ctx->io.total_write_bytes[i]);
+				atomic64_read(&ctx->io.total_write_bytes[i]));
 	}
 	pr_info("tieredvol: %s\n", result);
 	return 0;
@@ -336,10 +336,10 @@ static int msg_show_io_stats(struct dm_target *ti, unsigned int argc,
 				"%s%s:rd=%llu/%llu wr=%llu/%llu",
 				i > 0 ? " " : "",
 				ctx->meta.disk_names[i],
-				ctx->io.total_read_ops[i],
-				ctx->io.total_read_bytes[i],
-				ctx->io.total_write_ops[i],
-				ctx->io.total_write_bytes[i]);
+				atomic64_read(&ctx->io.total_read_ops[i]),
+				atomic64_read(&ctx->io.total_read_bytes[i]),
+				atomic64_read(&ctx->io.total_write_ops[i]),
+				atomic64_read(&ctx->io.total_write_bytes[i]));
 	}
 	pr_info("tieredvol: %s\n", result);
 	return 0;
@@ -352,10 +352,10 @@ static int msg_reset_io_stats(struct dm_target *ti, unsigned int argc,
 	int i;
 
 	for (i = 0; i < ctx->ndisks; i++) {
-		ctx->io.total_read_bytes[i] = 0;
-		ctx->io.total_write_bytes[i] = 0;
-		ctx->io.total_read_ops[i] = 0;
-		ctx->io.total_write_ops[i] = 0;
+		atomic64_set(&ctx->io.total_read_bytes[i], 0);
+		atomic64_set(&ctx->io.total_write_bytes[i], 0);
+		atomic64_set(&ctx->io.total_read_ops[i], 0);
+		atomic64_set(&ctx->io.total_write_ops[i], 0);
 	}
 	pr_info("tieredvol: IO stats reset\n");
 	return 0;
@@ -383,7 +383,7 @@ static int msg_reset_wear(struct dm_target *ti, unsigned int argc,
 	int i;
 
 	for (i = 0; i < ctx->ndisks; i++)
-		ctx->io.total_write_bytes[i] = 0;
+		atomic64_set(&ctx->io.total_write_bytes[i], 0);
 	pr_info("tieredvol: wear counters reset\n");
 	tv_log(TV_LOG_INFO, 0, TV_LOG_CONFIG, "wear reset");
 	return 0;
@@ -397,9 +397,9 @@ static int msg_show_mirror(struct dm_target *ti, unsigned int argc,
 
 	off += snprintf(result + off, maxlen - off,
 			"mirror_wr=%llu/%llu mirror_err=%llu",
-			ctx->mirror.mirror_write_ops,
-			ctx->mirror.mirror_write_bytes,
-			ctx->mirror.mirror_errors);
+			atomic64_read(&ctx->mirror.mirror_write_ops),
+			atomic64_read(&ctx->mirror.mirror_write_bytes),
+			atomic64_read(&ctx->mirror.mirror_errors));
 	for (i = 0; i < (int)ctx->meta.segment_count &&
 		     off < (int)maxlen - 2; i++) {
 		struct tieredvol_segment *seg = &ctx->meta.segments[i];

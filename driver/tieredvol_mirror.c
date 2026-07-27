@@ -174,9 +174,9 @@ void tv_mirror_end_io(struct bio *bio)
 	struct tieredvol_ctx *bio_ctx = bio->bi_private;
 
 	if (bio->bi_status != BLK_STS_OK)
-		bio_ctx->mirror.mirror_errors++;
+		atomic64_inc(&bio_ctx->mirror.mirror_errors);
 	else
-		bio_ctx->mirror.mirror_write_ops++;
+		atomic64_inc(&bio_ctx->mirror.mirror_write_ops);
 
 	tv_pw_remove(bio->bi_bdev, bio->bi_iter.bi_sector, bio->bi_iter.bi_size);
 
@@ -402,7 +402,7 @@ int tv_rebuild_thread(void *data)
 				continue;
 			}
 			bio_w->bi_iter.bi_sector =
-				cur.offset >> TV_SECTOR_SHIFT;
+				ctx->rebuild.offset >> TV_SECTOR_SHIFT;
 			bio_w->bi_iter.bi_size = chunk_bytes;
 			bio_w->bi_private = &ctx->rebuild.done_w;
 			bio_w->bi_end_io = tv_rebuild_end_io;

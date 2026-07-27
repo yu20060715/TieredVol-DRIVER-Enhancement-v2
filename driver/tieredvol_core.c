@@ -17,7 +17,7 @@
 
 #define DM_MSG_PREFIX "tieredvol"
 
-struct tieredvol_ctx *tv_active_ctx;
+struct tieredvol_ctx __rcu *tv_active_ctx;
 EXPORT_SYMBOL_GPL(tv_active_ctx);
 
 struct workqueue_struct *tv_wq;
@@ -73,11 +73,11 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 	bio->bi_iter.bi_sector = cur.offset >> TV_SECTOR_SHIFT;
 	atomic_add(bio->bi_iter.bi_size, &ctx->io.in_flight_bytes[cur.disk]);
 	if (bio_data_dir(bio) == WRITE) {
-		ctx->io.total_write_bytes[cur.disk] += bio->bi_iter.bi_size;
-		ctx->io.total_write_ops[cur.disk]++;
+		atomic64_add(bio->bi_iter.bi_size, &ctx->io.total_write_bytes[cur.disk]);
+		atomic64_inc(&ctx->io.total_write_ops[cur.disk]);
 	} else {
-		ctx->io.total_read_bytes[cur.disk] += bio->bi_iter.bi_size;
-		ctx->io.total_read_ops[cur.disk]++;
+		atomic64_add(bio->bi_iter.bi_size, &ctx->io.total_read_bytes[cur.disk]);
+		atomic64_inc(&ctx->io.total_read_ops[cur.disk]);
 	}
 
 	/* Mirror write: clone bio and submit to mirror disk */
@@ -101,8 +101,8 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 					TV_SECTOR_SHIFT;
 				clone->bi_private = ctx;
 				clone->bi_end_io = tv_mirror_end_io;
-				ctx->mirror.mirror_write_bytes +=
-					bio->bi_iter.bi_size;
+			atomic64_add(bio->bi_iter.bi_size,
+				     &ctx->mirror.mirror_write_bytes);
 				tv_pw_add(ctx->devs[seg->mirror_disk]->bdev,
 					  clone->bi_iter.bi_sector,
 					  bio->bi_iter.bi_size);
@@ -112,7 +112,7 @@ static int tieredvol_map(struct dm_target *ti, struct bio *bio)
 				       bio->bi_iter.bi_size >> 10,
 				       cur.seg_idx, seg->mirror_disk);
 			} else {
-				ctx->mirror.mirror_errors++;
+				atomic64_inc(&ctx->mirror.mirror_errors);
 				tv_log(TV_LOG_ERR, cur.disk, TV_LOG_MIRROR,
 				       "mirror alloc fail seg%d", cur.seg_idx);
 			}
@@ -202,7 +202,6 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	INIT_WORK(&ctx->trigger_event, trigger_event);
 
-	ctx->adaptive_enabled = false;
 	ctx->adaptive.policy = ctx->meta.runtime_policy;
 	ctx->adaptive.ema_weight_shift = ctx->meta.runtime_ema_shift ?
 						 ctx->meta.runtime_ema_shift :
@@ -212,9 +211,9 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 						      1000000ULL :
 					      5000000000ULL;
 	ctx->adaptive.wear_bias = ctx->meta.runtime_wear_bias;
-	ctx->mirror.mirror_write_bytes = 0;
-	ctx->mirror.mirror_write_ops = 0;
-	ctx->mirror.mirror_errors = 0;
+	atomic64_set(&ctx->mirror.mirror_write_bytes, 0);
+	atomic64_set(&ctx->mirror.mirror_write_ops, 0);
+	atomic64_set(&ctx->mirror.mirror_errors, 0);
 	ctx->deg.error_threshold = 10;
 	ctx->rebuild.thread = NULL;
 	ctx->rebuild.seg_idx = -1;
@@ -312,7 +311,7 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	ti->flush_bypasses_map = true;
 
 	ti->private = ctx;
-	tv_active_ctx = ctx;
+	rcu_assign_pointer(tv_active_ctx, ctx);
 	return 0;
 
 free_error_count:
@@ -352,8 +351,10 @@ static void tieredvol_dtr(struct dm_target *ti)
 
 	kfree(ctx->devs);
 	kfree(ctx->disk_sectors);
-	if (tv_active_ctx == ctx)
-		tv_active_ctx = NULL;
+	if (rcu_dereference_raw(tv_active_ctx) == ctx) {
+		rcu_assign_pointer(tv_active_ctx, NULL);
+		synchronize_rcu();
+	}
 	kfree(ctx);
 }
 
@@ -406,9 +407,9 @@ static void tieredvol_status(struct dm_target *ti, status_type_t type,
 		off += snprintf(result + off, maxlen - off,
 				"policy=%d mirror=%llu/%llu err=%llu",
 				ctx->adaptive.policy,
-				ctx->mirror.mirror_write_ops,
-				ctx->mirror.mirror_write_bytes,
-				ctx->mirror.mirror_errors);
+				atomic64_read(&ctx->mirror.mirror_write_ops),
+				atomic64_read(&ctx->mirror.mirror_write_bytes),
+				atomic64_read(&ctx->mirror.mirror_errors));
 
 		for (i = 0; i < ctx->ndisks && off < (int)maxlen - 2; i++) {
 			char status;
@@ -424,10 +425,10 @@ static void tieredvol_status(struct dm_target *ti, status_type_t type,
 			off += snprintf(result + off, maxlen - off,
 					" %c%s:rd=%llu/%llu wr=%llu/%llu",
 					status, ctx->meta.disk_names[i],
-					ctx->io.total_read_ops[i],
-					ctx->io.total_read_bytes[i],
-					ctx->io.total_write_ops[i],
-					ctx->io.total_write_bytes[i]);
+					atomic64_read(&ctx->io.total_read_ops[i]),
+					atomic64_read(&ctx->io.total_read_bytes[i]),
+					atomic64_read(&ctx->io.total_write_ops[i]),
+					atomic64_read(&ctx->io.total_write_bytes[i]));
 		}
 		if (atomic_read(&ctx->rebuild.running))
 			off += snprintf(result + off, maxlen - off,

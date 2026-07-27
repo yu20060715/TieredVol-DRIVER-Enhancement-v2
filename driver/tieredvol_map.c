@@ -10,7 +10,7 @@ static int tv_find_segment(u64 logical, const struct tieredvol_metadata *meta)
 	int lo = 0, hi = (int)meta->segment_count - 1;
 
 	while (lo <= hi) {
-		int mid = (lo + hi) / 2;
+		int mid = lo + (hi - lo) / 2;
 		const struct tieredvol_segment *seg = &meta->segments[mid];
 
 		if (logical < seg->logical_begin)
@@ -84,7 +84,7 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 					    u64 *ema_load, bool *stale,
 					    bool *degraded,
 					    int ndisks,
-					    u64 *total_write_bytes,
+					    atomic64_t *total_write_bytes,
 					    u32 wear_bias,
 					    u32 chunk_size)
 {
@@ -114,7 +114,7 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 
 	if (wear_bias > 0 && total_write_bytes) {
 		for (i = 0; i < ndisks; i++)
-			total_writes += total_write_bytes[i];
+			total_writes += atomic64_read(&total_write_bytes[i]);
 	}
 
 	for (i = 0; i < (int)seg->disk_count; i++) {
@@ -130,7 +130,7 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 
 		load = ema_load[d];
 		if (wear_bias > 0 && total_writes > 0 && total_write_bytes)
-			load += wear_bias * total_write_bytes[d] / total_writes;
+			load += wear_bias * atomic64_read(&total_write_bytes[d]) / total_writes;
 
 		if (load < best_load) {
 			best_load = load;
