@@ -193,20 +193,21 @@ TieredVol-DRIVER-Enhancement/
 │   └── tieredvol_meta.c          # Metadata loading from config file
 ├── src/
 │   ├── main.c                    # CLI entry point (tiered_setup)
-│   ├── tiered_common.h           # Input validation (name, fs, mount)
-│   ├── tiered_types.h            # Shared type definitions
+│   ├── tieredvol_common.h        # Input validation (name, fs, mount)
+│   ├── tieredvol_types.h         # Shared type definitions
 │   ├── version.h                 # Version string
-│   ├── tiered_mapper.c           # Offset mapping (userspace)
-│   ├── tiered_partition.c        # Weight + segment calculation
-│   ├── tiered_metadata.c         # Metadata save/load (INI format)
-│   ├── tiered_benchmark.c        # Initialization benchmark
-│   ├── tiered_io.c               # I/O benchmark tool (pwrite/pread)
-│   ├── warmup.c / warmup.h       # SLC cache warm-up
-│   ├── exec_helper.c / .h        # External command execution
-│   ├── setup_discover.c / .h     # Disk discovery (lsblk, sysfs)
-│   ├── setup_bench.c / .h        # Setup benchmark logic
+│   ├── tieredvol_umapper.c       # Offset mapping (userspace)
+│   ├── tieredvol_partition.c     # Weight + segment calculation
+│   ├── tieredvol_umeta.c         # Metadata save/load (INI format)
+│   ├── tieredvol_benchmark.c     # Initialization benchmark
+│   ├── tieredvol_warmup.c / .h   # SLC cache warm-up
+│   ├── tieredvol_exec.c / .h     # External command execution
+│   ├── tieredvol_discover.c / .h # Disk discovery (lsblk, sysfs)
+│   ├── tieredvol_bench.c / .h    # Setup benchmark logic
 │   ├── cmd_create.c / .h         # Volume creation (kernel dm + LVM)
-│   └── cmd_remove.c / .h         # Volume removal
+│   ├── cmd_remove.c / .h         # Volume removal
+│   ├── cmd_status.c / .h         # Target status queries
+│   └── cmd_scheduler.c / .h      # Scheduler (DM) volume creation
 ├── tests/
 │   ├── test_common.c             # Input validation tests
 │   ├── test_mapper.c             # Mapping tests
@@ -237,15 +238,16 @@ TieredVol-DRIVER-Enhancement/
 | `main.c` | CLI entry point: argument dispatch, dependency checks |
 | `cmd_create.c` | Volume creation: kernel dm target + legacy LVM |
 | `cmd_remove.c` | Volume removal: dmsetup remove + legacy teardown |
-| `tiered_io.c` | I/O benchmark: pwrite/pread on block devices |
-| `tiered_mapper.c` | Logical ↔ Physical offset mapping (userspace) |
-| `tiered_partition.c` | Weight calculation, capacity segmentation |
-| `tiered_metadata.c` | Metadata save/load (INI format) |
-| `tiered_benchmark.c` | Initialization benchmark |
-| `warmup.c` | SLC cache warm-up |
-| `exec_helper.c` | External command execution for dmsetup/lvm |
-| `setup_discover.c` | Disk discovery: list, filter, detect partitions |
-| `setup_bench.c` | Setup benchmark: parallel speed testing |
+| `cmd_status.c` | Target status queries |
+| `cmd_scheduler.c` | Scheduler (DM) volume creation |
+| `tieredvol_umapper.c` | Logical ↔ Physical offset mapping (userspace) |
+| `tieredvol_partition.c` | Weight calculation, capacity segmentation |
+| `tieredvol_umeta.c` | Metadata save/load (INI format) |
+| `tieredvol_benchmark.c` | Initialization benchmark |
+| `tieredvol_warmup.c` | SLC cache warm-up |
+| `tieredvol_exec.c` | External command execution for dmsetup/lvm |
+| `tieredvol_discover.c` | Disk discovery: list, filter, detect partitions |
+| `tieredvol_bench.c` | Setup benchmark: parallel speed testing |
 
 ---
 

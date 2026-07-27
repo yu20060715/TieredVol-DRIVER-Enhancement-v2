@@ -28,15 +28,15 @@ These files contain pure logic with no I/O dependencies:
 
 | File | Purpose | Action |
 |------|---------|--------|
-| `src/tiered_types.h` | Type definitions (TV_DISK, TV_SEGMENT, etc.) | **Keep**, remove io_uring-related structs |
-| `src/tiered_partition.c` | Weight calculation + segment building | **Keep as-is** |
-| `src/tiered_mapper.c` | Logical→physical offset mapping | **Keep as-is** |
-| `src/tiered_metadata.c` | Metadata save/load (INI format) | **Keep**, adapt for kernel config |
-| `src/tiered_common.h` | Input validation | **Keep as-is** |
+| `src/tieredvol_types.h` | Type definitions (TV_DISK, TV_SEGMENT, etc.) | **Keep**, remove io_uring-related structs |
+| `src/tieredvol_partition.c` | Weight calculation + segment building | **Keep as-is** |
+| `src/tieredvol_umapper.c` | Logical→physical offset mapping | **Keep as-is** |
+| `src/tieredvol_umeta.c` | Metadata save/load (INI format) | **Keep**, adapt for kernel config |
+| `src/tieredvol_common.h` | Input validation | **Keep as-is** |
 | `src/version.h` | Version string | **Keep**, update to 2.0.0 |
-| `src/exec_helper.c/h` | fork/exec for dmsetup | **Keep as-is** |
-| `src/setup_discover.c/h` | Disk discovery (lsblk, sysfs) | **Keep as-is** |
-| `src/setup_bench.c/h` | Disk speed benchmarking | **Keep as-is** |
+| `src/tieredvol_exec.c/h` | fork/exec for dmsetup | **Keep as-is** |
+| `src/tieredvol_discover.c/h` | Disk discovery (lsblk, sysfs) | **Keep as-is** |
+| `src/tieredvol_bench.c/h` | Disk speed benchmarking | **Keep as-is** |
 
 ## What to REMOVE
 
@@ -48,8 +48,8 @@ These are the userspace I/O path — replaced by kernel module:
 | `src/tiered_sched.h` | Scheduler API → replaced by kernel module API |
 | `src/tiered_io_uring.c` | io_uring wrappers → not needed in kernel |
 | `src/tiered_io_uring.h` | io_uring API → not needed |
-| `src/tiered_benchmark.c` | Init benchmark (O_DIRECT write) → replaced by kernel-side or kept in userspace tool |
-| `src/warmup.c/h` | SLC cache warmup → keep in userspace tool |
+| `src/tieredvol_benchmark.c` | Init benchmark (O_DIRECT write) → replaced by kernel-side or kept in userspace tool |
+| `src/tieredvol_warmup.c/h` | SLC cache warmup → keep in userspace tool |
 | `src/io_bench.c/h` | Benchmark runners → keep in userspace tool |
 | `src/tiered_io.c` | CLI I/O tool → rewrite to use dm target device directly |
 
