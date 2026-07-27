@@ -457,7 +457,7 @@ static int msg_show_log(struct dm_target *ti, unsigned int argc,
 	unsigned long flags;
 	int cnt = 0;
 
-	spin_lock_irqsave(&tv_log_lock, flags);
+	raw_spin_lock_irqsave(&tv_log_lock, flags);
 	while (cnt < 64 && kfifo_out(&tv_log_fifo, &entry, sizeof(entry))) {
 		pr_info("tieredvol: LOG %s %s: %s\n",
 			entry.level == TV_LOG_ERR ? "ERR" :
@@ -470,7 +470,7 @@ static int msg_show_log(struct dm_target *ti, unsigned int argc,
 			entry.msg);
 		cnt++;
 	}
-	spin_unlock_irqrestore(&tv_log_lock, flags);
+	raw_spin_unlock_irqrestore(&tv_log_lock, flags);
 
 	if (cnt == 0)
 		pr_info("tieredvol: LOG EMPTY\n");
@@ -484,9 +484,9 @@ static int msg_clear_log(struct dm_target *ti, unsigned int argc,
 {
 	unsigned long flags;
 
-	spin_lock_irqsave(&tv_log_lock, flags);
+	raw_spin_lock_irqsave(&tv_log_lock, flags);
 	kfifo_reset(&tv_log_fifo);
-	spin_unlock_irqrestore(&tv_log_lock, flags);
+	raw_spin_unlock_irqrestore(&tv_log_lock, flags);
 	pr_info("tieredvol: log cleared\n");
 	return 0;
 }

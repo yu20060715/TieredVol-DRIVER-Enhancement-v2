@@ -271,9 +271,12 @@ int tieredvol_end_io(struct dm_target *ti, struct bio *bio, blk_status_t *error)
 	}
 
 	/* Fix 2: Decrement in_flight_bytes on every completion */
-	if (disk_id >= 0)
+	if (disk_id >= 0) {
 		atomic_sub(bio->bi_iter.bi_size,
 			   &ctx->io.in_flight_bytes[disk_id]);
+		/* Adaptive v2: track completions per interval */
+		atomic64_inc(&ctx->io.interval_completions[disk_id]);
+	}
 
 	/* Error path */
 	if (bio->bi_status != BLK_STS_OK) {

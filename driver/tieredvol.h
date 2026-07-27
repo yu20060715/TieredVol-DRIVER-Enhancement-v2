@@ -66,6 +66,10 @@ struct tv_io_stats {
 	atomic64_t total_read_bytes[TV_MAX_DISKS];
 	atomic64_t total_write_ops[TV_MAX_DISKS];
 	atomic64_t total_read_ops[TV_MAX_DISKS];
+	/* Adaptive v2: latency + IOPS tracking */
+	atomic64_t total_latency_ns[TV_MAX_DISKS];
+	atomic64_t total_completions[TV_MAX_DISKS];
+	atomic64_t interval_completions[TV_MAX_DISKS];
 };
 
 struct tv_adaptive_state {
@@ -80,6 +84,10 @@ struct tv_adaptive_state {
 	struct timer_list decay_timer;
 	u32 wear_bias;
 	enum tv_policy policy;
+	/* Adaptive v2: multi-factor scoring */
+	u64 ema_latency_ns[TV_MAX_DISKS];
+	u64 ema_iops[TV_MAX_DISKS];
+	u32 write_boost;
 };
 
 struct tv_mirror_stats {
@@ -176,7 +184,7 @@ enum tv_log_event {
 };
 
 extern struct kfifo tv_log_fifo;
-extern spinlock_t tv_log_lock;
+extern raw_spinlock_t tv_log_lock;
 extern u8 tv_log_level;
 extern unsigned int log_size;
 extern struct workqueue_struct *tv_wq;

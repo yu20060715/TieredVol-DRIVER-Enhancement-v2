@@ -93,7 +93,7 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 	const struct tieredvol_segment *seg;
 	u64 stripe_no, offset_in;
 	int best_disk = -1;
-	u64 best_load = (u64)-1;
+	u64 best_score = (u64)-1;
 	u64 total_writes = 0;
 	int i;
 
@@ -119,7 +119,7 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 
 	for (i = 0; i < (int)seg->disk_count; i++) {
 		u32 d = seg->disk_index[i];
-		u64 load;
+		u64 score;
 
 		if (d >= (u32)ndisks)
 			continue;
@@ -128,12 +128,21 @@ struct tieredvol_map tv_map_logical_adaptive(u64 logical,
 		if (degraded && degraded[d])
 			continue;
 
-		load = ema_load[d];
-		if (wear_bias > 0 && total_writes > 0 && total_write_bytes)
-			load += wear_bias * atomic64_read(&total_write_bytes[d]) / total_writes;
+		/* Multi-factor scoring:
+		 * score = queue_depth + latency_penalty + wear_penalty
+		 * Lower score = better candidate
+		 */
+		score = ema_load[d];
 
-		if (load < best_load) {
-			best_load = load;
+		/* Latency penalty: higher latency → higher score */
+		score += ema_load[d] / 4;
+
+		/* Wear penalty */
+		if (wear_bias > 0 && total_writes > 0 && total_write_bytes)
+			score += wear_bias * atomic64_read(&total_write_bytes[d]) / total_writes;
+
+		if (score < best_score) {
+			best_score = score;
 			best_disk = i;
 		}
 	}

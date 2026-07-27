@@ -73,7 +73,7 @@ MODULE_PARM_DESC(log_size, "Ring buffer log entries (default 512, power of 2)");
 struct kfifo tv_log_fifo;
 EXPORT_SYMBOL_GPL(tv_log_fifo);
 
-spinlock_t tv_log_lock = __SPIN_LOCK_UNLOCKED(tv_log_lock);
+raw_spinlock_t tv_log_lock = __RAW_SPIN_LOCK_UNLOCKED(tv_log_lock);
 EXPORT_SYMBOL_GPL(tv_log_lock);
 
 u8 tv_log_level = TV_LOG_INFO;
@@ -97,15 +97,17 @@ void tv_log(u8 level, u8 disk_idx, u8 event_type, const char *fmt, ...)
 	vsnprintf(entry.msg, sizeof(entry.msg), fmt, args);
 	va_end(args);
 
-	spin_lock_irqsave(&tv_log_lock, flags);
+	raw_spin_lock_irqsave(&tv_log_lock, flags);
 	kfifo_in(&tv_log_fifo, &entry, sizeof(entry));
-	spin_unlock_irqrestore(&tv_log_lock, flags);
+	raw_spin_unlock_irqrestore(&tv_log_lock, flags);
 }
 EXPORT_SYMBOL_GPL(tv_log);
 
-/* ---- EMA decay timer ---- */
+/* ---- EMA decay timer (Adaptive v2: adaptive interval) ---- */
 
-#define TV_DECAY_INTERVAL (HZ)
+/* Fast decay (100ms) when system is busy, slow decay (1s) when idle */
+#define TV_DECAY_FAST (HZ / 10)
+#define TV_DECAY_SLOW (HZ)
 
 void tv_decay_timer_fn(struct timer_list *timer)
 {
@@ -114,14 +116,25 @@ void tv_decay_timer_fn(struct timer_list *timer)
 	u64 alpha = (alpha_shift < 10) ? (1ULL << alpha_shift) : 1024;
 	u64 one_minus_alpha = 1024 - alpha;
 	u64 now = ktime_get_boottime_ns();
+	u64 total_activity = 0;
 	int i;
+	int next_interval;
 
 	for (i = 0; i < ctx->ndisks; i++) {
 		u64 snapshot = (u64)atomic_xchg(&ctx->io.in_flight_bytes[i], 0);
+		u64 completions = (u64)atomic64_xchg(&ctx->io.interval_completions[i], 0);
 
+		total_activity += snapshot + completions;
+
+		/* EMA load (bytes per interval) */
 		ctx->adaptive.ema_load[i] =
 			(ctx->adaptive.ema_load[i] * one_minus_alpha +
 			 snapshot * alpha) >> 10;
+
+		/* EMA IOPS (completions per interval, smoothed) */
+		ctx->adaptive.ema_iops[i] =
+			(ctx->adaptive.ema_iops[i] * one_minus_alpha +
+			 completions * alpha) >> 10;
 
 		ctx->adaptive.last_interval_bytes[i] = snapshot;
 
@@ -164,5 +177,7 @@ void tv_decay_timer_fn(struct timer_list *timer)
 		}
 	}
 
-	mod_timer(&ctx->adaptive.decay_timer, jiffies + TV_DECAY_INTERVAL);
+	/* Adaptive interval: fast when busy, slow when idle */
+	next_interval = (total_activity > 1024) ? TV_DECAY_FAST : TV_DECAY_SLOW;
+	mod_timer(&ctx->adaptive.decay_timer, jiffies + next_interval);
 }
