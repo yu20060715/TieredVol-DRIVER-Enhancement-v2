@@ -1,5 +1,5 @@
 CC=gcc
-CFLAGS=-D_GNU_SOURCE -Wall -Wextra -Wpedantic -std=gnu11 -O2
+CFLAGS=-D_GNU_SOURCE -Wall -Wextra -Wpedantic -std=gnu11 -O2 -Icommon
 PREFIX=/usr/local
 
 SCHED_OBJS=src/tiered_partition.o src/tiered_mapper.o \

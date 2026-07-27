@@ -3,13 +3,15 @@
 
 #include <stdint.h>
 #include <signal.h>
+#include "tieredvol_meta_format.h"
 
 extern volatile sig_atomic_t g_shutdown_requested;
 
-#define TV_MAX_DISKS    16
-#define TV_MAX_SEGS     16
-#define TV_MAX_WEIGHT   16
-#define TV_CHUNK_SIZE (1 * 1024 * 1024)
+/* Aliases: canonical constants live in tieredvol_meta_format.h */
+#define TV_MAX_DISKS    TV_META_MAX_DISKS
+#define TV_MAX_SEGS     TV_META_MAX_SEGS
+#define TV_MAX_WEIGHT   TV_META_MAX_WEIGHT
+#define TV_CHUNK_SIZE   TV_META_CHUNK_SIZE
 #define TV_OK       0
 #define TV_ERR      (-1)
 

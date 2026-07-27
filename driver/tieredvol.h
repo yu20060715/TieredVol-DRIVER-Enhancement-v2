@@ -9,11 +9,13 @@
 #include <linux/bio.h>
 #include <linux/completion.h>
 #include <linux/workqueue.h>
+#include "tieredvol_meta_format.h"
 
-#define TV_MAX_DISKS    16
-#define TV_MAX_SEGS     16
-#define TV_MAX_WEIGHT   16
-#define TV_CHUNK_SIZE   (1UL << 20)
+/* Aliases: canonical constants live in tieredvol_meta_format.h */
+#define TV_MAX_DISKS    TV_META_MAX_DISKS
+#define TV_MAX_SEGS     TV_META_MAX_SEGS
+#define TV_MAX_WEIGHT   TV_META_MAX_WEIGHT
+#define TV_CHUNK_SIZE   TV_META_CHUNK_SIZE
 #define TV_SECTOR_SHIFT 9
 #define TV_SECTOR_SIZE  (1 << TV_SECTOR_SHIFT)
 

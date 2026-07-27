@@ -1,3 +1,5 @@
+ccflags-y += -I$(M)/../common
+
 obj-m := tieredvol.o
 tieredvol-objs := tieredvol_core.o tieredvol_map.o tieredvol_meta.o \
                   tieredvol_log.o tieredvol_mirror.o tieredvol_sysfs.o \
