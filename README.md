@@ -37,17 +37,17 @@ Application
 - Integrity (CRC32C), atomic (O_DIRECT), crypto (AES-256-XTS) passthrough
 - Error detection with per-disk error_count and workqueue event notification
 
-### Key Results (kernel dm-target v4.6.0, fio + io_uring + QD=256)
+### Key Results (kernel dm-target v5.0, fio + io_uring + QD=256)
 
-| Config | Write | Efficiency | vs Theory |
-|--------|-------|------------|-----------|
-| 3-disk [1,1,6] | **1499 MB/s** | 75% | 1499/1999 |
-| 2-disk [1,7] | 1370 MB/s | 80% | 1370/1713 |
-| 2-disk [1,6] | 1383 MB/s | 79% | 1383/1749 |
+| Config | Write | Read | vs Raw | vs LVM |
+|--------|-------|------|--------|--------|
+| 4-disk [nvme,sdb,sdc,sdd] | **3325 MB/s** | **4063 MB/s** | 81%/99% | +136%/+122% |
+| 3-disk [nvme,sdb,sdc] | 2893 MB/s | 3938 MB/s | 83%/100% | +111%/+174% |
+| 2-disk [nvme,sdb] | 2179 MB/s | 3261 MB/s | 82%/97% | +129%/+238% |
 
-Hardware: i5-4570, NVMe CT1000P3PSSD8 (~1499 MB/s via PCIe 2.0 x4 adapter), SATA CT500MX500SSD1 (~517 MB/s), SATA WDC WDS250G2B0A (~536 MB/s). Both SATA on same Intel 8 Series/C220 controller (shared bus ~957 MB/s combined).
+Hardware: NVMe P3 Plus 1T (PCIe 3.0 x4, ~2783 MB/s), SATA MX500 (~481 MB/s), WD Blue (~492 MB/s), BX100 (~366 MB/s).
 
-DM overhead: **<1%** (raw NVMe 1475 MB/s vs DM 1499 MB/s). The 25% gap from theoretical is primarily due to the B85 platform's PCIe 2.0 x4 bandwidth limit (~1600 MB/s practical) and multi-device scheduling overhead.
+vs LVM: LVM fixed stripe 4-disk W 1407 / R 1829 MB/s. TieredVol weighted striping + adaptive EMA beats LVM by 100-238%.
 
 ### What Is Intentionally Excluded
 
@@ -180,103 +180,92 @@ sudo make install       # Install to /usr/local/bin/
 ## Project Structure
 
 ```
-TieredVol-DRIVER-Enhancement/
+TieredVol-DRIVER-Enhancement-v2/
 ├── README.md
-├── plan.md                       # Development roadmap (historical)
-├── MIGRATION.md                  # Migration plan from userspace to kernel
+├── VERIFY.md                        # Verification results + benchmarks
 ├── Makefile
-├── driver/                       # Kernel dm-target module
-│   ├── Kbuild                    # Kernel build configuration
-│   ├── tieredvol.h               # Shared kernel types
-│   ├── tieredvol_core.c          # dm_target ops, bio submission, completion
-│   ├── tieredvol_map.c           # Logical → Physical offset mapping
-│   └── tieredvol_meta.c          # Metadata loading from config file
-├── src/
-│   ├── main.c                    # CLI entry point (tiered_setup)
-│   ├── tieredvol_common.h        # Input validation (name, fs, mount)
-│   ├── tieredvol_types.h         # Shared type definitions
-│   ├── version.h                 # Version string
-│   ├── tieredvol_umapper.c       # Offset mapping (userspace)
-│   ├── tieredvol_partition.c     # Weight + segment calculation
-│   ├── tieredvol_umeta.c         # Metadata save/load (INI format)
-│   ├── tieredvol_benchmark.c     # Initialization benchmark
-│   ├── tieredvol_warmup.c / .h   # SLC cache warm-up
-│   ├── tieredvol_exec.c / .h     # External command execution
-│   ├── tieredvol_discover.c / .h # Disk discovery (lsblk, sysfs)
-│   ├── tieredvol_bench.c / .h    # Setup benchmark logic
-│   ├── cmd_create.c / .h         # Volume creation (kernel dm + LVM)
-│   ├── cmd_remove.c / .h         # Volume removal
-│   ├── cmd_status.c / .h         # Target status queries
-│   └── cmd_scheduler.c / .h      # Scheduler (DM) volume creation
-├── tests/
-│   ├── test_common.c             # Input validation tests
-│   ├── test_mapper.c             # Mapping tests
-│   ├── test_partition.c          # Weight/segment tests
-│   └── test_metadata.c           # Metadata round-trip tests
-├── benchmarks/                   # Raw benchmark data and summary
+├── driver/                          # Kernel dm-target module
+│   ├── tieredvol.h                  # Central header: all structs + exports
+│   ├── tieredvol_core.c             # DM lifecycle: ctr/dtr/map/status/init/exit
+│   ├── tieredvol_map.c              # Logical→Physical: static/adaptive/random
+│   ├── tieredvol_mirror.c           # Mirror I/O + pending tracking + end_io
+│   ├── tieredvol_log.c              # Log ring buffer + EMA decay timer
+│   ├── tieredvol_meta.c             # Metadata read/write (config file)
+│   ├── tieredvol_sysfs.c            # sysfs interface
+│   ├── tieredvol_message.c          # DM message handler (show/set commands)
+│   └── Makefile
+├── src/                             # Userspace tools
+│   ├── tiered_setup                 # CLI: create/setup/configure
+│   ├── tieredvol_benchmark.c        # Benchmark utility
+│   ├── tieredvol_partition.c        # Disk partitioning logic
+│   └── cmd_create.c / cmd_scheduler.c / ...
+├── tests/                           # Test suite
+│   ├── test_*.sh                    # Shell integration tests (48)
+│   └── test_*.c                     # C unit tests (81)
 ├── docs/
-│   ├── USAGE.md                  # Detailed usage guide
-│   ├── PARTITION_SPLITTING.md    # Weighted striping algorithm
-│   ├── WEIGHTED_IO_SCHEDULER.md  # I/O dispatch implementation
-│   └── BENCHMARK-RESULTS.md      # Benchmark results on B85 platform
+│   ├── USAGE.md                     # Usage tutorial
+│   └── PARTITION_SPLITTING.md       # Weighted striping algorithm
+├── plan/
+│   └── asym-raid-comparison.md      # Academic comparison (Asym-RAID)
 └── scripts/
-    ├── install_deps.sh           # Dependency installer
-    ├── test_scheduler.sh         # End-to-end test
-    ├── tieredvol-restore.sh      # Boot-time volume restore
-    └── tieredvol-restore.service # Systemd service
+    ├── test_scheduler.sh            # End-to-end test
+    └── tieredvol-restore.sh         # Boot-time volume restore
 ```
 
-### Code Architecture
+### Kernel Module Architecture
 
-| Module | Responsibility |
-|--------|---------------|
-| **Kernel module** | |
-| `driver/tieredvol_core.c` | dm_target ctr/dtr/map, bio splitting, weighted dispatch |
-| `driver/tieredvol_map.c` | Logical → Physical offset mapping (kernel) |
-| `driver/tieredvol_meta.c` | Metadata loading from config file (kernel) |
-| **Userspace tools** | |
-| `main.c` | CLI entry point: argument dispatch, dependency checks |
-| `cmd_create.c` | Volume creation: kernel dm target + legacy LVM |
-| `cmd_remove.c` | Volume removal: dmsetup remove + legacy teardown |
-| `cmd_status.c` | Target status queries |
-| `cmd_scheduler.c` | Scheduler (DM) volume creation |
-| `tieredvol_umapper.c` | Logical ↔ Physical offset mapping (userspace) |
-| `tieredvol_partition.c` | Weight calculation, capacity segmentation |
-| `tieredvol_umeta.c` | Metadata save/load (INI format) |
-| `tieredvol_benchmark.c` | Initialization benchmark |
-| `tieredvol_warmup.c` | SLC cache warm-up |
-| `tieredvol_exec.c` | External command execution for dmsetup/lvm |
-| `tieredvol_discover.c` | Disk discovery: list, filter, detect partitions |
-| `tieredvol_bench.c` | Setup benchmark: parallel speed testing |
+| File | Responsibility |
+|------|---------------|
+| `tieredvol_core.c` | DM lifecycle, I/O entry (`tieredvol_map`), module init/exit |
+| `tieredvol_map.c` | Logical→Physical mapping (static/adaptive/random dispatch) |
+| `tieredvol_mirror.c` | Mirror I/O, pending tracking (per-CPU), timestamp ring, end_io handler |
+| `tieredvol_log.c` | Log ring buffer, EMA decay timer (load/latency/IOPS tracking) |
+| `tieredvol_meta.c` | Config file parse/save, CRC32 validation |
+| `tieredvol_message.c` | DM message commands (show/set/modify at runtime) |
+| `tieredvol_sysfs.c` | sysfs attributes |
+
+### I/O Flow
+
+```
+User → write()/read() → VFS → bio → tieredvol_map()
+  → tv_map_logical_adaptive()     # Multi-factor scoring: load + latency + wear
+  → tv_ts_submit()                # Record submit timestamp
+  → [mirror?] → bio_alloc_clone() → submit_bio(clone)
+  → return DM_MAPIO_REMAPPED      # DM submits to physical disk
+  ...
+  → tieredvol_end_io()            # Completion: latency delta, in_flight--
+    → tv_ts_complete()            # Calculate latency
+    → [mirror retry?] → schedule_delayed_work()
+```
 
 ---
 
-## Kernel Module (v4.6.0)
+## Kernel Module (v5.0)
 
 The `tieredvol` dm target processes bios in-kernel:
 
 1. **bio arrives** at the dm target (from VFS `write()`/`read()`)
-2. **Map**: `tv_map_logical()` translates logical byte offset → (disk, physical_offset, remaining)
-3. **Policy**: static weights, adaptive (EMA load + wear bias), or random per-segment
+2. **Map**: `tv_map_logical_adaptive()` translates logical byte offset → (disk, physical_offset)
+3. **Scoring**: multi-factor score = EMA load + EMA latency + wear penalty (lower = better)
 4. **Mirror**: if enabled, `bio_alloc_clone()` + fire-and-forget to redundant disk
 5. **Redirect**: `bio_set_dev()` + sector update → DM core submits to underlying device
 
 Key features:
-- `DM_TARGET_NOWAIT`: Non-blocking bio dispatch (optimized for io_uring)
+- `DM_TARGET_NOWAIT`: Non-blocking bio dispatch
 - `flush_bypasses_map`: Flush FUA bios bypass the map function
 - `dm_set_target_max_io_len()`: Bio splitting at chunk boundaries
-- Per-CPU statistics counters (zero contention)
-- **Map overhead: 0.25 µs/bio** (ftrace profiled)
+- **Adaptive EMA dispatch**: load + latency + wear scoring per bio
+- **Per-CPU pending arrays**: lockless write path for mirror tracking
+- **Per-disk timestamp ring**: latency tracking for adaptive scoring
+- **Mempool**: zero OOM for mirror/retry contexts
 - Mirror/RAID1: per-segment `mirror_enabled` + `mirror_disk` config
-- Adaptive striping: EMA-based load balancing with `ema_weight_shift` (default α=0.8%)
-- Staleness detection: 1s timer, grace period fallback to static weights
-- Wear leveling: per-disk `total_write_bytes[]` with `wear_bias` parameter
-- Integrity (CRC32C), atomic (O_DIRECT), crypto (AES-256-XTS) DM target passthrough
+- Staleness detection: adaptive timer (100ms busy / 1s idle), grace period
+- CRC32 config validation (two-pass parse)
+- Error detection with per-disk error_count and degraded mode
 
 Key constants:
-- `TV_CHUNK_SIZE` = 1 MB (weight unit)
-- `TV_MAX_DISKS` = 16
-- `TV_MAX_SEGS` = 16
+- `TV_MAX_DISKS` = 8
+- `TV_MAX_SEGS` = 8
 
 ### Metadata Format
 
@@ -304,14 +293,12 @@ seg0_policy=adaptive   # optional: static (default), adaptive, random
 
 ## Limitations
 
-- **Static weights only by default** — Adaptive striping available via `set_policy` message, but requires timer support.
+- **Static weights only by default** — Adaptive striping available via `set_policy` message.
 - **No parity-based redundancy** — Mirror/RAID1 supported, but no RAID5/6.
-- **No POSIX write() interception** — Applications use standard `write()`/`read()` on the dm target device.
 - **No crash consistency** — No journaling or metadata recovery.
 - **System disk cannot be used** — dm returns EBUSY on mounted root partition.
 - **Module instability risk** — A kernel module bug can oops the system.
 - **NVMe write cache must stay ON** — Disabling it causes -21% throughput loss.
-- **Platform bottleneck**: B85 PCIe 2.0 x4 adapter limits NVMe to ~1600 MB/s (drive supports PCIe 4.0). Upgrade to PCIe 3.0/4.0 platform for higher throughput.
 
 ## License
 
