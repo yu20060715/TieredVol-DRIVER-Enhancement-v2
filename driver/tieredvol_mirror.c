@@ -45,6 +45,8 @@ void tv_pending_add(struct block_device *bdev, sector_t sector,
 		tv_pending_reads[idx].size = size;
 		tv_pending_reads[idx].mirror_disk = mirror_disk;
 		tv_pending_count++;
+	} else {
+		pr_warn_once("tieredvol: pending-read array full, dropping entry\n");
 	}
 	spin_unlock_irqrestore(&tv_pending_lock, flags);
 }
@@ -110,6 +112,8 @@ void tv_pw_add(struct block_device *bdev, sector_t sector, unsigned int size)
 		tv_pending_writes[idx].sector = sector;
 		tv_pending_writes[idx].size = size;
 		tv_pw_count++;
+	} else {
+		pr_warn_once("tieredvol: pending-write array full, dropping entry\n");
 	}
 	spin_unlock_irqrestore(&tv_pw_lock, flags);
 }
@@ -184,6 +188,23 @@ void tv_mirror_end_io(struct bio *bio)
 }
 EXPORT_SYMBOL_GPL(tv_mirror_end_io);
 
+/* ---- Read-only mirror completion (for retries) ---- */
+
+static void tv_mirror_read_end_io(struct bio *bio)
+{
+	struct tieredvol_ctx *bio_ctx = bio->bi_private;
+
+	if (bio->bi_status != BLK_STS_OK)
+		atomic64_inc(&bio_ctx->mirror.mirror_errors);
+	else
+		atomic64_inc(&bio_ctx->mirror.mirror_read_ops);
+
+	tv_pw_remove(bio->bi_bdev, bio->bi_iter.bi_sector,
+		     bio->bi_iter.bi_size);
+
+	bio_put(bio);
+}
+
 /* ---- Read retry work ---- */
 
 static void tv_read_retry_work(struct work_struct *work)
@@ -195,11 +216,17 @@ static void tv_read_retry_work(struct work_struct *work)
 
 	if (tv_pw_is_pending(rc->ctx->devs[rc->mirror_disk]->bdev,
 			     rc->sector, rc->size)) {
-		tv_log(TV_LOG_INFO, rc->mirror_disk, TV_LOG_MIRROR,
-		       "retry delayed (mirror write pending) sec=%llu",
+		if (rc->retries-- > 0) {
+			tv_log(TV_LOG_INFO, rc->mirror_disk, TV_LOG_MIRROR,
+			       "retry delayed (pending) sec=%llu retries=%d",
+			       (u64)rc->sector, rc->retries);
+			schedule_delayed_work(&rc->dwork, msecs_to_jiffies(1));
+			return;
+		}
+		tv_log(TV_LOG_WARN, rc->mirror_disk, TV_LOG_MIRROR,
+		       "retry giving up (pending too long) sec=%llu",
 		       (u64)rc->sector);
-		schedule_delayed_work(&rc->dwork, msecs_to_jiffies(1));
-		return;
+		goto out;
 	}
 
 	clone = bio_alloc(rc->ctx->devs[rc->mirror_disk]->bdev, 1,
@@ -212,7 +239,7 @@ static void tv_read_retry_work(struct work_struct *work)
 
 	clone->bi_iter.bi_sector = rc->sector;
 	clone->bi_iter.bi_size = rc->size;
-	clone->bi_end_io = tv_mirror_end_io;
+	clone->bi_end_io = tv_mirror_read_end_io;
 	clone->bi_private = rc->ctx;
 
 	submit_bio(clone);
@@ -280,6 +307,7 @@ int tieredvol_end_io(struct dm_target *ti, struct bio *bio, blk_status_t *error)
 								bio->bi_iter.bi_size;
 							rc->mirror_disk =
 								mirror;
+							rc->retries = 32;
 							schedule_delayed_work(
 								&rc->dwork, 0);
 							tv_log(TV_LOG_INFO,
@@ -314,6 +342,7 @@ int tv_rebuild_thread(void *data)
 	struct tieredvol_segment *seg;
 	struct bio *bio_r, *bio_w;
 	unsigned int chunk_bytes;
+	int backoff_ms = 10;
 
 	while (!kthread_should_stop()) {
 		if (!atomic_read(&ctx->rebuild.running))
@@ -342,13 +371,15 @@ int tv_rebuild_thread(void *data)
 			cur = tv_map_logical(logical_addr, &ctx->meta,
 					     ctx->meta.chunk_size);
 			if (cur.disk < 0 || cur.length == 0) {
-				msleep(10);
+				msleep(backoff_ms);
+				backoff_ms = min(backoff_ms * 2, 1000);
 				continue;
 			}
 
 			pg = alloc_page(GFP_NOIO);
 			if (!pg) {
-				msleep(10);
+				msleep(backoff_ms);
+				backoff_ms = min(backoff_ms * 2, 1000);
 				continue;
 			}
 
@@ -358,7 +389,8 @@ int tv_rebuild_thread(void *data)
 					  REQ_OP_READ, GFP_NOIO);
 			if (!bio_r) {
 				put_page(pg);
-				msleep(10);
+				msleep(backoff_ms);
+				backoff_ms = min(backoff_ms * 2, 1000);
 				continue;
 			}
 			bio_r->bi_iter.bi_sector = cur.offset >> TV_SECTOR_SHIFT;
@@ -370,7 +402,8 @@ int tv_rebuild_thread(void *data)
 			    chunk_bytes) {
 				put_page(pg);
 				bio_put(bio_r);
-				msleep(10);
+				msleep(backoff_ms);
+				backoff_ms = min(backoff_ms * 2, 1000);
 				continue;
 			}
 
@@ -382,7 +415,8 @@ int tv_rebuild_thread(void *data)
 				       ctx->rebuild.offset);
 				put_page(pg);
 				bio_put(bio_r);
-				msleep(100);
+				msleep(backoff_ms);
+				backoff_ms = min(backoff_ms * 2, 1000);
 				continue;
 			}
 			bio_put(bio_r);
@@ -398,7 +432,8 @@ int tv_rebuild_thread(void *data)
 					  REQ_OP_WRITE, GFP_NOIO);
 			if (!bio_w) {
 				put_page(pg);
-				msleep(10);
+				msleep(backoff_ms);
+				backoff_ms = min(backoff_ms * 2, 1000);
 				continue;
 			}
 			bio_w->bi_iter.bi_sector =
@@ -411,7 +446,8 @@ int tv_rebuild_thread(void *data)
 			    chunk_bytes) {
 				put_page(pg);
 				bio_put(bio_w);
-				msleep(10);
+				msleep(backoff_ms);
+				backoff_ms = min(backoff_ms * 2, 1000);
 				continue;
 			}
 
@@ -423,11 +459,13 @@ int tv_rebuild_thread(void *data)
 				       ctx->rebuild.offset);
 				put_page(pg);
 				bio_put(bio_w);
-				msleep(100);
+				msleep(backoff_ms);
+				backoff_ms = min(backoff_ms * 2, 1000);
 				continue;
 			}
 			put_page(pg);
 			bio_put(bio_w);
+			backoff_ms = 10;
 		}
 
 		ctx->rebuild.offset += chunk_bytes;
@@ -448,6 +486,7 @@ int tv_rebuild_thread(void *data)
 	}
 
 	atomic_set(&ctx->rebuild.running, 0);
+	ctx->rebuild.thread = NULL;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(tv_rebuild_thread);

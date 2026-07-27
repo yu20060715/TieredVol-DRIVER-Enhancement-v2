@@ -442,7 +442,7 @@ static int msg_show_log(struct dm_target *ti, unsigned int argc,
 	int cnt = 0;
 
 	spin_lock_irqsave(&tv_log_lock, flags);
-	while (kfifo_out(&tv_log_fifo, &entry, sizeof(entry))) {
+	while (cnt < 64 && kfifo_out(&tv_log_fifo, &entry, sizeof(entry))) {
 		pr_info("tieredvol: LOG %s %s: %s\n",
 			entry.level == TV_LOG_ERR ? "ERR" :
 			entry.level == TV_LOG_WARN ? "WRN" : "INF",

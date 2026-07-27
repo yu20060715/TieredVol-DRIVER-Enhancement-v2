@@ -147,6 +147,8 @@ int tv_metadata_load_kernel(struct tieredvol_metadata *meta,
 			vfree(buf);
 			return (int)nr;
 		}
+		if (nr == 0)
+			pr_warn("tieredvol: config file is empty\n");
 		buf[nr] = '\0';
 	}
 

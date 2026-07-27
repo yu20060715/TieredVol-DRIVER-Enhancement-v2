@@ -85,6 +85,7 @@ struct tv_adaptive_state {
 struct tv_mirror_stats {
 	atomic64_t mirror_write_bytes;
 	atomic64_t mirror_write_ops;
+	atomic64_t mirror_read_ops;
 	atomic64_t mirror_errors;
 };
 
@@ -196,6 +197,7 @@ struct tv_retry_ctx {
 	sector_t sector;
 	unsigned int size;
 	int mirror_disk;
+	int retries;
 };
 
 int tv_rebuild_thread(void *data);

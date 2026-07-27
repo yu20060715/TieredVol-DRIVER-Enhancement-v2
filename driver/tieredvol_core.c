@@ -213,6 +213,7 @@ static int tieredvol_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	ctx->adaptive.wear_bias = ctx->meta.runtime_wear_bias;
 	atomic64_set(&ctx->mirror.mirror_write_bytes, 0);
 	atomic64_set(&ctx->mirror.mirror_write_ops, 0);
+	atomic64_set(&ctx->mirror.mirror_read_ops, 0);
 	atomic64_set(&ctx->mirror.mirror_errors, 0);
 	ctx->deg.error_threshold = 10;
 	ctx->rebuild.thread = NULL;
